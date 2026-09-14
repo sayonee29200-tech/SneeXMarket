@@ -1,19 +1,16 @@
 """
-Player-vs-Player Betting Bot for Telegram with Native Dice & Emoji Support
-==========================================================================
+Player-vs-Player Betting Bot for Telegram with Native Dice & Automatic Settlement
+=================================================================================
 
-Lets group members challenge each other to bets using virtual points
-(no real money involved). Flow:
+Lets group members challenge each other to bets using virtual points.
+Flow:
 
-    /bet @opponent 100 🎲
-        -> creates a pending challenge using Telegram's dice emoji (🎲, 🎯, 🎳, 🏀, ⚽, 🎰)
+    /bet @opponent 100 🎲 even
+        -> creates a pending challenge picking 'even' for a dice roll
 
     /accept <bet_id>
-        -> opponent accepts, points are locked from both balances
-
-    /resolve <bet_id> @winner
-        -> either participant (or a group admin) declares the winner,
-           points move from loser to winner
+        -> opponent accepts, Telegram rolls the dice animation, determines if the result
+           is even or odd, and automatically transfers points to the winner.
 
     /cancel <bet_id>
         -> challenger can cancel a bet that hasn't been accepted yet
@@ -86,7 +83,8 @@ def init_db():
                 opponent_id INTEGER,
                 opponent_name TEXT,
                 amount INTEGER NOT NULL,
-                description TEXT,
+                emoji TEXT NOT NULL DEFAULT '🎲',
+                prediction TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 winner_id INTEGER,
                 created_at TEXT
@@ -156,10 +154,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*Commands*\n"
-        "/bet @user amount [description/emoji] - challenge someone\n"
-        "/accept <bet_id> - accept a challenge made to you\n"
-        "/resolve <bet_id> @winner - declare the winner\n"
-        "/cancel <bet_id> - cancel your own unaccepted bet\n"
+        "/bet @user amount [emoji] <even|odd> - challenge someone\n"
+        "  _Example: /bet @alice 50 🎲 even_\n"
+        "/accept <bet_id> - accept challenge & auto-roll\n"
+        "/cancel <bet_id> - cancel your unaccepted bet\n"
         "/mybets - list your open/pending bets\n"
         "/balance - check your points\n"
         "/leaderboard - top balances in this chat\n\n"
@@ -172,16 +170,18 @@ async def bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     challenger = update.effective_user
 
-    if len(context.args) < 2:
+    if len(context.args) < 3:
         await update.message.reply_text(
-            "Usage: /bet @opponent amount [description/emoji]\n"
-            "Example: /bet @alice 50 🎲"
+            "Usage: /bet @opponent amount [emoji] <even|odd>\n"
+            "Examples:\n"
+            "  /bet @alice 50 even\n"
+            "  /bet @bob 100 🎲 odd"
         )
         return
 
     opponent_tag = context.args[0]
     if not opponent_tag.startswith("@"):
-        await update.message.reply_text("Tag your opponent with @username, e.g. /bet @alice 50 ...")
+        await update.message.reply_text("Tag your opponent with @username, e.g. /bet @alice 50 even")
         return
 
     try:
@@ -192,7 +192,20 @@ async def bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Amount must be a positive whole number of points.")
         return
 
-    description = " ".join(context.args[2:]) or "🎲 Dice Roll"
+    # Parse optional emoji and prediction choice
+    args_tail = context.args[2:]
+    target_emoji = "🎲"
+    prediction = None
+
+    for arg in args_tail:
+        if arg in VALID_EMOJIS:
+            target_emoji = arg
+        elif arg.lower() in ("even", "odd"):
+            prediction = arg.lower()
+
+    if not prediction:
+        await update.message.reply_text("You must choose 'even' or 'odd'. Example: /bet @alice 50 🎲 even")
+        return
 
     with closing(get_conn()) as conn:
         ensure_user(conn, chat_id, challenger.id, challenger.username)
@@ -208,8 +221,8 @@ async def bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.execute(
             """
             INSERT INTO bets (chat_id, challenger_id, challenger_name, opponent_id,
-                               opponent_name, amount, description, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                               opponent_name, amount, emoji, prediction, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
             """,
             (
                 chat_id,
@@ -218,18 +231,23 @@ async def bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 opponent_id,
                 opponent_tag.lstrip("@"),
                 amount,
-                description,
+                target_emoji,
+                prediction,
                 datetime.utcnow().isoformat(),
             ),
         )
         conn.commit()
         bet_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
 
+    opposite_prediction = "odd" if prediction == "even" else "even"
     await update.message.reply_text(
         f"🎲 Bet #{bet_id} created!\n"
         f"{challenger.first_name} challenges {opponent_tag} for {amount} points.\n"
-        f"Game mode / Bet: {description}\n\n"
-        f"{opponent_tag}, reply with /accept {bet_id} to accept."
+        f"Game: {target_emoji} roll\n"
+        f"Prediction: @{challenger.username or challenger.first_name} picked *{prediction.upper()}* "
+        f"(giving {opponent_tag} *{opposite_prediction.upper()}*)\n\n"
+        f"{opponent_tag}, reply with /accept {bet_id} to start!",
+        parse_mode="Markdown"
     )
 
 
@@ -282,86 +300,32 @@ async def accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.commit()
 
-    # Trigger Telegram's native dice animation if an emoji was provided in description
-    target_emoji = None
-    for char in bet["description"]:
-        if char in VALID_EMOJIS:
-            target_emoji = char
-            break
-
     await update.message.reply_text(
-        f"✅ Bet #{bet_id} accepted! {bet['amount']} points are on the line."
+        f"✅ Bet #{bet_id} accepted! Rolling {bet['emoji']}..."
     )
 
-    if target_emoji:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"Rolling {target_emoji} for Bet #{bet_id}..."
-        )
-        await context.bot.send_dice(chat_id=chat_id, emoji=target_emoji)
+    # Roll the native Telegram animated dice
+    dice_msg = await context.bot.send_dice(chat_id=chat_id, emoji=bet["emoji"])
+    rolled_value = dice_msg.dice.value
 
-    await update.message.reply_text(
-        f"Either player (or an admin) can resolve it with /resolve {bet_id} @winner"
-    )
+    # Determine Even or Odd outcome
+    is_even = (rolled_value % 2 == 0)
+    outcome = "even" if is_even else "odd"
 
+    challenger_prediction = bet["prediction"]
+    
+    if outcome == challenger_prediction:
+        winner_id = bet["challenger_id"]
+        loser_id = user.id
+        winner_name = bet["challenger_name"]
+    else:
+        winner_id = user.id
+        loser_id = bet["challenger_id"]
+        winner_name = user.username or user.first_name
 
-async def resolve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /resolve <bet_id> @winner")
-        return
-    try:
-        bet_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("bet_id must be a number.")
-        return
-    winner_tag = context.args[1].lstrip("@")
+    amount = bet["amount"]
 
     with closing(get_conn()) as conn:
-        bet = conn.execute(
-            "SELECT * FROM bets WHERE bet_id=? AND chat_id=?", (bet_id, chat_id)
-        ).fetchone()
-        if bet is None:
-            await update.message.reply_text("No bet with that ID here.")
-            return
-        if bet["status"] != "accepted":
-            await update.message.reply_text(f"Bet #{bet_id} isn't in an accepted state.")
-            return
-
-        participants = {bet["challenger_id"], bet["opponent_id"]}
-        is_admin = False
-        member = await context.bot.get_chat_member(chat_id, user.id)
-        if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-            is_admin = True
-
-        if user.id not in participants and not is_admin:
-            await update.message.reply_text("Only the two players or a group admin can resolve this bet.")
-            return
-
-        challenger_row = conn.execute(
-            "SELECT username FROM users WHERE chat_id=? AND user_id=?",
-            (chat_id, bet["challenger_id"]),
-        ).fetchone()
-        opponent_row = conn.execute(
-            "SELECT username FROM users WHERE chat_id=? AND user_id=?",
-            (chat_id, bet["opponent_id"]),
-        ).fetchone()
-
-        winner_id = None
-        loser_id = None
-        if challenger_row and (challenger_row["username"] or "").lower() == winner_tag.lower():
-            winner_id, loser_id = bet["challenger_id"], bet["opponent_id"]
-        elif opponent_row and (opponent_row["username"] or "").lower() == winner_tag.lower():
-            winner_id, loser_id = bet["opponent_id"], bet["challenger_id"]
-        else:
-            await update.message.reply_text(
-                "That username doesn't match either player in this bet."
-            )
-            return
-
-        amount = bet["amount"]
         adjust_balance(conn, chat_id, winner_id, amount)
         adjust_balance(conn, chat_id, loser_id, -amount)
         conn.execute(
@@ -371,7 +335,9 @@ async def resolve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
 
     await update.message.reply_text(
-        f"🏆 Bet #{bet_id} resolved! @{winner_tag} wins {amount} points."
+        f"🎯 Result: Rolled a *{rolled_value}* ({outcome.upper()})!\n"
+        f"🏆 @{winner_name} wins Bet #{bet_id} and receives {amount} points!",
+        parse_mode="Markdown"
     )
 
 
@@ -431,7 +397,7 @@ async def mybets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         lines.append(
             f"#{r['bet_id']} [{r['status']}] {r['challenger_name']} vs "
-            f"{r['opponent_name']} - {r['amount']} pts - {r['description']}"
+            f"{r['opponent_name']} - {r['amount']} pts ({r['emoji']} {r['prediction']})"
         )
     await update.message.reply_text("\n".join(lines))
 
@@ -441,7 +407,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     with closing(get_conn()) as conn:
         balance = ensure_user(conn, chat_id, user.id, user.username)
-    await update.message.reply_text(f"💰 Your balance: {balance} ₹")
+    await update.message.reply_text(f"💰 Your balance: {balance} points")
 
 
 async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -504,7 +470,6 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("bet", bet_cmd))
     app.add_handler(CommandHandler("accept", accept_cmd))
-    app.add_handler(CommandHandler("resolve", resolve_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("mybets", mybets_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
