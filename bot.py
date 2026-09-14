@@ -3,17 +3,29 @@ Player-vs-Player Betting Bot for Telegram with Native Dice & Automatic Settlemen
 =================================================================================
 
 Lets group members challenge each other to bets using virtual points.
+
 Flow:
 
-    /bet @opponent 100 🎲 even
-        -> creates a pending challenge picking 'even' for a dice roll
+    /bet @opponent
+        -> or reply to someone's message with /bet
+        -> bot asks for the amount (send it as a reply to the bot's prompt)
+        -> bot shows inline buttons to pick the game (dice, darts, bowling, ...)
+        -> bot shows inline buttons to pick even/odd
+        -> challenge is posted
 
+    /bet @opponent 100 🎲 even
+        -> fast path: skips the conversation and creates the bet directly
+
+    /accept
+        -> reply to the bot's challenge message with /accept (no bet id needed)
     /accept <bet_id>
-        -> opponent accepts, Telegram rolls the dice animation, determines if the result
-           is even or odd, and automatically transfers points to the winner.
+        -> or accept by id directly
 
     /cancel <bet_id>
         -> challenger can cancel a bet that hasn't been accepted yet
+
+    /mybets
+        -> list your open/pending bets
 
     /balance
         -> check your point balance
@@ -23,6 +35,12 @@ Flow:
 
     /help
         -> list commands
+
+NOTE ON GROUP PRIVACY MODE:
+Telegram bots only receive plain text messages in groups if privacy mode is
+disabled for the bot, OR the message is a reply to the bot / mentions the bot.
+The amount-prompt step below uses ForceReply so the user's answer is always a
+reply to the bot, which guarantees delivery even with default privacy mode on.
 """
 
 import logging
@@ -33,9 +51,21 @@ from contextlib import closing
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telegram import Update
-from telegram.constants import ChatMemberStatus
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import (
+    ForceReply,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -46,8 +76,19 @@ logger = logging.getLogger(__name__)
 DB_PATH = os.path.join(os.path.dirname(__file__), "bet_bot.db")
 STARTING_BALANCE = 1000
 
-# Supported Telegram animated dice emojis
-VALID_EMOJIS = {"🎲", "🎯", "🎳", "🏀", "⚽", "🎰"}
+# Supported Telegram animated dice emojis, with display labels for buttons
+GAME_EMOJI_LABELS = {
+    "🎲": "Dice",
+    "🎯": "Darts",
+    "🎳": "Bowling",
+    "🏀": "Basketball",
+    "⚽": "Football",
+    "🎰": "Slots",
+}
+VALID_EMOJIS = set(GAME_EMOJI_LABELS.keys())
+
+# Conversation states for the /bet flow
+ASK_AMOUNT, ASK_GAME, ASK_PREDICTION = range(3)
 
 
 # ---------------------------------------------------------------------------
@@ -87,11 +128,18 @@ def init_db():
                 prediction TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 winner_id INTEGER,
+                challenge_message_id INTEGER,
                 created_at TEXT
             )
             """
         )
         conn.commit()
+        # Migration for DBs created before challenge_message_id existed
+        try:
+            conn.execute("ALTER TABLE bets ADD COLUMN challenge_message_id INTEGER")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
 
 def ensure_user(conn, chat_id, user_id, username):
@@ -139,7 +187,7 @@ def find_user_id_by_username(conn, chat_id, username):
 
 
 # ---------------------------------------------------------------------------
-# Command handlers
+# Basic command handlers
 # ---------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -154,69 +202,203 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*Commands*\n"
-        "/bet @user amount [emoji] <even|odd> - challenge someone\n"
-        "  _Example: /bet @alice 50 🎲 even_\n"
-        "/accept <bet_id> - accept challenge & auto-roll\n"
+        "/bet @user - or reply to someone's message with /bet - start a challenge\n"
+        "  _You'll be asked for the amount, then the game, then even/odd via buttons_\n"
+        "  _Fast path: /bet @alice 100 🎲 even_\n"
+        "/accept - reply to the bot's challenge message with /accept to take it\n"
+        "/accept <bet_id> - or accept by id directly\n"
         "/cancel <bet_id> - cancel your unaccepted bet\n"
         "/mybets - list your open/pending bets\n"
         "/balance - check your points\n"
         "/leaderboard - top balances in this chat\n\n"
-        "Supported Telegram animated dice: 🎲 🎯 🎳 🏀 ⚽ 🎰",
+        "Supported games: 🎲 Dice, 🎯 Darts, 🎳 Bowling, 🏀 Basketball, ⚽ Football, 🎰 Slots",
         parse_mode="Markdown",
     )
 
 
-async def bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------------------------------------------------------------------
+# /bet conversation flow
+# ---------------------------------------------------------------------------
+
+async def bet_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     challenger = update.effective_user
 
-    if len(context.args) < 3:
+    with closing(get_conn()) as conn:
+        ensure_user(conn, chat_id, challenger.id, challenger.username)
+
+    args = context.args or []
+    opponent_id = None
+    opponent_username = None
+    opponent_display = None
+    remaining_args = args
+
+    if args and args[0].startswith("@"):
+        opponent_username = args[0].lstrip("@")
+        with closing(get_conn()) as conn:
+            opponent_id = find_user_id_by_username(conn, chat_id, opponent_username)
+        opponent_display = f"@{opponent_username}"
+        remaining_args = args[1:]
+    elif update.message.reply_to_message and update.message.reply_to_message.from_user:
+        replied = update.message.reply_to_message.from_user
+        if replied.is_bot:
+            await update.message.reply_text("You can't challenge a bot.")
+            return ConversationHandler.END
+        if replied.id == challenger.id:
+            await update.message.reply_text("You can't challenge yourself.")
+            return ConversationHandler.END
+        opponent_id = replied.id
+        opponent_username = replied.username
+        opponent_display = f"@{replied.username}" if replied.username else replied.first_name
+        with closing(get_conn()) as conn:
+            ensure_user(conn, chat_id, replied.id, replied.username)
+        remaining_args = args
+    else:
         await update.message.reply_text(
-            "Usage: /bet @opponent amount [emoji] <even|odd>\n"
-            "Examples:\n"
-            "  /bet @alice 50 even\n"
-            "  /bet @bob 100 🎲 odd"
+            "Tell me who to challenge:\n"
+            "• /bet @username\n"
+            "• or reply to their message with /bet"
         )
-        return
+        return ConversationHandler.END
 
-    opponent_tag = context.args[0]
-    if not opponent_tag.startswith("@"):
-        await update.message.reply_text("Tag your opponent with @username, e.g. /bet @alice 50 even")
-        return
+    context.user_data["bet_challenge"] = {
+        "opponent_id": opponent_id,
+        "opponent_username": opponent_username,
+        "opponent_display": opponent_display,
+        "challenger_id": challenger.id,
+    }
 
+    # Fast path for power users: /bet @user 100 🎲 even
+    if len(remaining_args) >= 2:
+        amount = None
+        try:
+            candidate = int(remaining_args[0])
+            if candidate > 0:
+                amount = candidate
+        except ValueError:
+            amount = None
+
+        if amount is not None:
+            emoji = "🎲"
+            prediction = None
+            for a in remaining_args[1:]:
+                if a in VALID_EMOJIS:
+                    emoji = a
+                elif a.lower() in ("even", "odd"):
+                    prediction = a.lower()
+            if prediction:
+                await _create_bet_and_announce(update, context, amount, emoji, prediction)
+                context.user_data.pop("bet_challenge", None)
+                return ConversationHandler.END
+
+    await update.message.reply_text(
+        f"Challenging {opponent_display}! How many points do you want to bet?\n"
+        f"(reply to this message with a number)",
+        reply_markup=ForceReply(selective=True),
+    )
+    return ASK_AMOUNT
+
+
+async def ask_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
     try:
-        amount = int(context.args[1])
+        amount = int(text)
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Amount must be a positive whole number of points.")
-        return
+        await update.message.reply_text(
+            "Please send a positive whole number of points.",
+            reply_markup=ForceReply(selective=True),
+        )
+        return ASK_AMOUNT
 
-    # Parse optional emoji and prediction choice
-    args_tail = context.args[2:]
-    target_emoji = "🎲"
-    prediction = None
+    chat_id = update.effective_chat.id
+    challenger = update.effective_user
+    with closing(get_conn()) as conn:
+        balance = get_balance(conn, chat_id, challenger.id)
 
-    for arg in args_tail:
-        if arg in VALID_EMOJIS:
-            target_emoji = arg
-        elif arg.lower() in ("even", "odd"):
-            prediction = arg.lower()
+    if balance is None or balance < amount:
+        await update.message.reply_text(
+            f"You only have {balance or 0} points — pick a smaller amount.",
+            reply_markup=ForceReply(selective=True),
+        )
+        return ASK_AMOUNT
 
-    if not prediction:
-        await update.message.reply_text("You must choose 'even' or 'odd'. Example: /bet @alice 50 🎲 even")
-        return
+    context.user_data["bet_challenge"]["amount"] = amount
+
+    keyboard = [
+        [InlineKeyboardButton(f"{emoji} {label}", callback_data=f"game:{emoji}")]
+        for emoji, label in GAME_EMOJI_LABELS.items()
+    ]
+    await update.message.reply_text(
+        "Pick a game:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return ASK_GAME
+
+
+async def ask_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    emoji = query.data.split(":", 1)[1]
+    context.user_data.setdefault("bet_challenge", {})["emoji"] = emoji
+
+    keyboard = [
+        [
+            InlineKeyboardButton("Even", callback_data="pred:even"),
+            InlineKeyboardButton("Odd", callback_data="pred:odd"),
+        ]
+    ]
+    await query.edit_message_text(
+        f"Game: {emoji} {GAME_EMOJI_LABELS.get(emoji, '')}\nNow pick your prediction:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return ASK_PREDICTION
+
+
+async def ask_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    prediction = query.data.split(":", 1)[1]
+    data = context.user_data.get("bet_challenge", {})
+    amount = data.get("amount")
+    emoji = data.get("emoji")
+
+    if amount is None or emoji is None:
+        await query.edit_message_text("Something went wrong — please start again with /bet.")
+        context.user_data.pop("bet_challenge", None)
+        return ConversationHandler.END
+
+    await query.edit_message_text("Creating bet...")
+    await _create_bet_and_announce(update, context, amount, emoji, prediction, via_callback=True)
+    context.user_data.pop("bet_challenge", None)
+    return ConversationHandler.END
+
+
+async def bet_cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("bet_challenge", None)
+    await update.message.reply_text("Bet creation cancelled.")
+    return ConversationHandler.END
+
+
+async def _create_bet_and_announce(update, context, amount, emoji, prediction, via_callback=False):
+    """Shared logic to insert the bet row and post the challenge message."""
+    chat_id = update.effective_chat.id
+    challenger = update.effective_user
+    data = context.user_data.get("bet_challenge", {})
+    opponent_id = data.get("opponent_id")
+    opponent_username = data.get("opponent_username")
+    opponent_display = data.get("opponent_display") or "opponent"
 
     with closing(get_conn()) as conn:
-        ensure_user(conn, chat_id, challenger.id, challenger.username)
-        balance = get_balance(conn, chat_id, challenger.id)
+        balance = ensure_user(conn, chat_id, challenger.id, challenger.username)
         if balance < amount:
-            await update.message.reply_text(
-                f"You only have {balance} points - can't bet {amount}."
-            )
+            msg = f"You only have {balance} points - can't bet {amount}."
+            if via_callback:
+                await context.bot.send_message(chat_id, msg)
+            else:
+                await update.message.reply_text(msg)
             return
-
-        opponent_id = find_user_id_by_username(conn, chat_id, opponent_tag)
 
         conn.execute(
             """
@@ -229,9 +411,9 @@ async def bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 challenger.id,
                 challenger.username or challenger.first_name,
                 opponent_id,
-                opponent_tag.lstrip("@"),
+                opponent_username,
                 amount,
-                target_emoji,
+                emoji,
                 prediction,
                 datetime.utcnow().isoformat(),
             ),
@@ -240,28 +422,72 @@ async def bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bet_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
 
     opposite_prediction = "odd" if prediction == "even" else "even"
-    await update.message.reply_text(
+    challenger_tag = f"@{challenger.username}" if challenger.username else challenger.first_name
+    text = (
         f"🎲 Bet #{bet_id} created!\n"
-        f"{challenger.first_name} challenges {opponent_tag} for {amount} points.\n"
-        f"Game: {target_emoji} roll\n"
-        f"Prediction: @{challenger.username or challenger.first_name} picked *{prediction.upper()}* "
-        f"(giving {opponent_tag} *{opposite_prediction.upper()}*)\n\n"
-        f"{opponent_tag}, reply with /accept {bet_id} to start!",
-        parse_mode="Markdown"
+        f"{challenger_tag} challenges {opponent_display} for {amount} points.\n"
+        f"Game: {emoji}\n"
+        f"Prediction: {challenger_tag} picked *{prediction.upper()}* "
+        f"(giving {opponent_display} *{opposite_prediction.upper()}*)\n\n"
+        f"{opponent_display}, reply to THIS message with /accept to start!"
     )
+    sent = await context.bot.send_message(chat_id, text, parse_mode="Markdown")
 
+    with closing(get_conn()) as conn:
+        conn.execute(
+            "UPDATE bets SET challenge_message_id=? WHERE bet_id=?",
+            (sent.message_id, bet_id),
+        )
+        conn.commit()
+
+
+bet_conv = ConversationHandler(
+    entry_points=[CommandHandler("bet", bet_start)],
+    states={
+        ASK_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_amount)],
+        ASK_GAME: [CallbackQueryHandler(ask_game, pattern="^game:")],
+        ASK_PREDICTION: [CallbackQueryHandler(ask_prediction, pattern="^pred:")],
+    },
+    fallbacks=[CommandHandler("cancel", bet_cancel_conv)],
+    name="bet_conversation",
+    persistent=False,
+)
+
+
+# ---------------------------------------------------------------------------
+# /accept, /cancel, /mybets, /balance, /leaderboard
+# ---------------------------------------------------------------------------
 
 async def accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
 
-    if not context.args:
-        await update.message.reply_text("Usage: /accept <bet_id>")
-        return
-    try:
-        bet_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("bet_id must be a number.")
+    bet_id = None
+
+    if context.args:
+        try:
+            bet_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("bet_id must be a number.")
+            return
+    elif update.message.reply_to_message and update.message.reply_to_message.from_user:
+        replied = update.message.reply_to_message
+        if replied.from_user.id == context.bot.id:
+            with closing(get_conn()) as conn:
+                row = conn.execute(
+                    """
+                    SELECT bet_id FROM bets
+                    WHERE chat_id=? AND challenge_message_id=? AND status='pending'
+                    """,
+                    (chat_id, replied.message_id),
+                ).fetchone()
+            if row:
+                bet_id = row["bet_id"]
+
+    if bet_id is None:
+        await update.message.reply_text(
+            "Reply to the bet challenge message with /accept, or use /accept <bet_id>."
+        )
         return
 
     with closing(get_conn()) as conn:
@@ -308,12 +534,11 @@ async def accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dice_msg = await context.bot.send_dice(chat_id=chat_id, emoji=bet["emoji"])
     rolled_value = dice_msg.dice.value
 
-    # Determine Even or Odd outcome
     is_even = (rolled_value % 2 == 0)
     outcome = "even" if is_even else "odd"
 
     challenger_prediction = bet["prediction"]
-    
+
     if outcome == challenger_prediction:
         winner_id = bet["challenger_id"]
         loser_id = user.id
@@ -468,7 +693,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("bet", bet_cmd))
+    app.add_handler(bet_conv)
     app.add_handler(CommandHandler("accept", accept_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("mybets", mybets_cmd))
