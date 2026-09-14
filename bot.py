@@ -1,12 +1,12 @@
 """
-Player-vs-Player Betting Bot for Telegram
-==========================================
+Player-vs-Player Betting Bot for Telegram with Native Dice & Emoji Support
+==========================================================================
 
 Lets group members challenge each other to bets using virtual points
 (no real money involved). Flow:
 
-    /bet @opponent 100 who wins the match tonight?
-        -> creates a pending challenge from you to @opponent for 100 points
+    /bet @opponent 100 🎲
+        -> creates a pending challenge using Telegram's dice emoji (🎲, 🎯, 🎳, 🏀, ⚽, 🎰)
 
     /accept <bet_id>
         -> opponent accepts, points are locked from both balances
@@ -26,15 +26,6 @@ Lets group members challenge each other to bets using virtual points
 
     /help
         -> list commands
-
-Setup:
-    1. pip install -r requirements.txt
-    2. Get a bot token from @BotFather on Telegram
-    3. export BOT_TOKEN="your-token-here"
-    4. python bot.py
-
-Data is stored in bet_bot.db (SQLite) in the same folder, so balances and
-bets persist across restarts.
 """
 
 import logging
@@ -57,6 +48,9 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "bet_bot.db")
 STARTING_BALANCE = 1000
+
+# Supported Telegram animated dice emojis
+VALID_EMOJIS = {"🎲", "🎯", "🎳", "🏀", "⚽", "🎰"}
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +107,6 @@ def ensure_user(conn, chat_id, user_id, username):
         )
         conn.commit()
         return STARTING_BALANCE
-    # keep username fresh
     if username and row["username"] != username:
         conn.execute(
             "UPDATE users SET username=? WHERE chat_id=? AND user_id=?",
@@ -163,14 +156,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*Commands*\n"
-        "/bet @user amount description - challenge someone\n"
+        "/bet @user amount [description/emoji] - challenge someone\n"
         "/accept <bet_id> - accept a challenge made to you\n"
         "/resolve <bet_id> @winner - declare the winner\n"
         "/cancel <bet_id> - cancel your own unaccepted bet\n"
         "/mybets - list your open/pending bets\n"
         "/balance - check your points\n"
         "/leaderboard - top balances in this chat\n\n"
-        "All points are virtual - nothing here is real money.",
+        "Supported Telegram animated dice: 🎲 🎯 🎳 🏀 ⚽ 🎰",
         parse_mode="Markdown",
     )
 
@@ -181,8 +174,8 @@ async def bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Usage: /bet @opponent amount description\n"
-            "Example: /bet @alice 50 who wins the chess match"
+            "Usage: /bet @opponent amount [description/emoji]\n"
+            "Example: /bet @alice 50 🎲"
         )
         return
 
@@ -199,7 +192,7 @@ async def bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Amount must be a positive whole number of points.")
         return
 
-    description = " ".join(context.args[2:]) or "unspecified"
+    description = " ".join(context.args[2:]) or "🎲 Dice Roll"
 
     with closing(get_conn()) as conn:
         ensure_user(conn, chat_id, challenger.id, challenger.username)
@@ -211,8 +204,6 @@ async def bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         opponent_id = find_user_id_by_username(conn, chat_id, opponent_tag)
-        # opponent may not have interacted with the bot yet - that's fine,
-        # we store the tag and resolve the id when they /accept.
 
         conn.execute(
             """
@@ -237,7 +228,7 @@ async def bet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🎲 Bet #{bet_id} created!\n"
         f"{challenger.first_name} challenges {opponent_tag} for {amount} points.\n"
-        f"Bet: {description}\n\n"
+        f"Game mode / Bet: {description}\n\n"
         f"{opponent_tag}, reply with /accept {bet_id} to accept."
     )
 
@@ -291,8 +282,25 @@ async def accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.commit()
 
+    # Trigger Telegram's native dice animation if an emoji was provided in description
+    target_emoji = None
+    for char in bet["description"]:
+        if char in VALID_EMOJIS:
+            target_emoji = char
+            break
+
     await update.message.reply_text(
-        f"✅ Bet #{bet_id} accepted! {bet['amount']} points are on the line.\n"
+        f"✅ Bet #{bet_id} accepted! {bet['amount']} points are on the line."
+    )
+
+    if target_emoji:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"Rolling {target_emoji} for Bet #{bet_id}..."
+        )
+        await context.bot.send_dice(chat_id=chat_id, emoji=target_emoji)
+
+    await update.message.reply_text(
         f"Either player (or an admin) can resolve it with /resolve {bet_id} @winner"
     )
 
@@ -332,7 +340,6 @@ async def resolve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Only the two players or a group admin can resolve this bet.")
             return
 
-        # figure out which participant matches winner_tag
         challenger_row = conn.execute(
             "SELECT username FROM users WHERE chat_id=? AND user_id=?",
             (chat_id, bet["challenger_id"]),
@@ -434,7 +441,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     with closing(get_conn()) as conn:
         balance = ensure_user(conn, chat_id, user.id, user.username)
-    await update.message.reply_text(f"💰 Your balance: {balance} points")
+    await update.message.reply_text(f"💰 Your balance: {balance} ₹")
 
 
 async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -457,9 +464,7 @@ async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Tiny HTTP server so Render's Web Service health check has a port to hit.
-# The bot itself only talks to Telegram via polling; this thread just
-# answers "OK" to keep the platform happy.
+# HTTP Health Check Server
 # ---------------------------------------------------------------------------
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -470,7 +475,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
-        pass  # silence per-request logging
+        pass
 
 
 def start_health_server():
