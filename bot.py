@@ -1,106 +1,683 @@
-"""
-Player-vs-Player Betting Bot for Telegram
-=========================================
-
-Features:
-1. Group = gameplay
-2. DM = wallet/dashboard
-3. Persistent PostgreSQL database
-4. Deposits: UPI / USDT BEP-20
-5. Withdrawals: UPI / USDT BEP-20
-6. Admin panel
-7. Tax configuration
-8. Ban / unban users
-9. Transaction approval
-10. Persistent bets and balances
-11. Render-compatible health server
-
-IMPORTANT:
-Set these environment variables on Render:
-
-BOT_TOKEN
-DATABASE_URL
-ADMIN_IDS
-GROUP_LINK
-"""
-
 import logging
 import os
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
-from telegram import (
-    ForceReply,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    ConversationHandler,
-    MessageHandler,
-    filters,
-)
-
-
-# ============================================================================
-# LOGGING
-# ============================================================================
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-
-DATABASE_URL = os.environ.get("DATABASE_URL")
-
-STARTING_BALANCE = 1000
-
-ADMIN_IDS = [
-    int(i.strip())
-    for i in os.environ.get("ADMIN_IDS", "").split(",")
-    if i.strip().isdigit()
-]
-
-GROUP_LINK = os.environ.get(
-    "GROUP_LINK",
-    "https://t.me/your_group_link",
-)
-
-
-# ============================================================================
-# GAME CONFIGURATION
-# ============================================================================
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '').strip()
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+STARTING_BALANCE = int(os.environ.get('STARTING_BALANCE', '1000'))
+ADMIN_IDS = [int(x.strip()) for x in os.environ.get('ADMIN_IDS', '').split(',') if x.strip().isdigit()]
+GROUP_LINK = os.environ.get('GROUP_LINK', 'https://t.me/your_group_link').strip()
 
 GAME_EMOJI_LABELS = {
-    "🎲": "Dice",
-    "🎯": "Darts",
-    "🎳": "Bowling",
-    "🏀": "Basketball",
-    "⚽": "Football",
-    "🎰": "Slots",
+    '🎲': 'Dice',
+    '🎯': 'Darts',
+    '🎳': 'Bowling',
+    '🏀': 'Basketball',
+    '⚽': 'Football',
+    '🎰': 'Slots',
 }
+VALID_EMOJIS = set(GAME_EMOJI_LABELS)
 
-VALID_EMOJIS = set(GAME_EMOJI_LABELS.keys())
+ASK_AMOUNT, ASK_GAME, ASK_PREDICTION, DEP_METHOD, DEP_AMOUNT, WITH_METHOD, WITH_AMOUNT, WITH_ADDRESS, SET_TAX_STATE, BAN_USER_STATE, SET_UPI_STATE, SET_USDT_STATE = range(12)
 
 
+def require_config():
+    if not BOT_TOKEN:
+        raise SystemExit('Fatal Error: BOT_TOKEN environment variable is missing.')
+    if not DATABASE_URL:
+        raise SystemExit('Fatal Error: DATABASE_URL environment variable is missing.')
+
+
+@contextmanager
+def db():
+    conn = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        yield conn
+        conn.commit()
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+
+def init_db():
+    statements = [
+        "CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, username TEXT, first_name TEXT, balance BIGINT NOT NULL DEFAULT 1000, is_banned BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+        "CREATE TABLE IF NOT EXISTS bets (bet_id BIGSERIAL PRIMARY KEY, chat_id BIGINT NOT NULL, challenger_id BIGINT NOT NULL, challenger_name TEXT, opponent_id BIGINT, opponent_name TEXT, amount BIGINT NOT NULL, emoji TEXT NOT NULL DEFAULT '🎲', prediction TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', winner_id BIGINT, challenge_message_id BIGINT, dice_value INTEGER, outcome TEXT, tax_percent INTEGER NOT NULL DEFAULT 0, tax_amount BIGINT NOT NULL DEFAULT 0, payout BIGINT NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), accepted_at TIMESTAMPTZ, resolved_at TIMESTAMPTZ)",
+        "CREATE TABLE IF NOT EXISTS transactions (tx_id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, tx_type TEXT NOT NULL, method TEXT NOT NULL, amount BIGINT NOT NULL, details TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), processed_at TIMESTAMPTZ, processed_by BIGINT)",
+        "CREATE TABLE IF NOT EXISTS system_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        "INSERT INTO system_config (key, value) VALUES ('tax_percent', '0') ON CONFLICT (key) DO NOTHING",
+        "INSERT INTO system_config (key, value) VALUES ('upi_id', 'not_set@upi') ON CONFLICT (key) DO NOTHING",
+        "INSERT INTO system_config (key, value) VALUES ('usdt_bep20_address', 'not_set') ON CONFLICT (key) DO NOTHING",
+    ]
+    with db() as conn:
+        with conn.cursor() as cur:
+            for sql in statements:
+                cur.execute(sql)
+    logger.info('PostgreSQL database initialized.')
+
+
+def ensure_user(user_id, username=None, first_name=None):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT balance, is_banned FROM users WHERE user_id = %s', (user_id,))
+            row = cur.fetchone()
+            if row is None:
+                cur.execute('INSERT INTO users (user_id, username, first_name, balance) VALUES (%s, %s, %s, %s)', (user_id, username, first_name, STARTING_BALANCE))
+                return STARTING_BALANCE, False
+            cur.execute('UPDATE users SET username = %s, first_name = %s, updated_at = NOW() WHERE user_id = %s', (username, first_name, user_id))
+            return int(row['balance']), bool(row['is_banned'])
+
+
+def is_banned(user_id):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT is_banned FROM users WHERE user_id = %s', (user_id,))
+            row = cur.fetchone()
+            return bool(row and row['is_banned'])
+
+
+def get_balance(user_id):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT balance FROM users WHERE user_id = %s', (user_id,))
+            row = cur.fetchone()
+            return int(row['balance']) if row else 0
+
+
+def adjust_balance(conn, user_id, delta):
+    with conn.cursor() as cur:
+        cur.execute('UPDATE users SET balance = balance + %s, updated_at = NOW() WHERE user_id = %s', (delta, user_id))
+        if cur.rowcount != 1:
+            raise RuntimeError(f'User {user_id} does not exist')
+
+
+def get_config(key):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT value FROM system_config WHERE key = %s', (key,))
+            row = cur.fetchone()
+            return row['value'] if row else ''
+
+
+def set_config(key, value):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('INSERT INTO system_config (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', (key, value))
+
+
+def find_user(username):
+    username = username.lstrip('@')
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT user_id FROM users WHERE username ILIKE %s LIMIT 1', (username,))
+            row = cur.fetchone()
+            return row['user_id'] if row else None
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    ensure_user(user.id, user.username, user.first_name)
+    if is_banned(user.id):
+        if update.message:
+            await update.message.reply_text('🚫 You are banned from using this bot.')
+        return
+    if update.effective_chat.type == 'private':
+        await dashboard(update, context)
+    else:
+        await update.message.reply_text('🎮 Betting Bot is active!\n\nUse /bet @username 100 🎲 even\nor reply to a player message with /bet 100 🎲 even.\n\nUse /wallet in DM to open your wallet.')
+
+
+async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.username, user.first_name)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT balance FROM users WHERE user_id = %s', (user.id,))
+            balance = int(cur.fetchone()['balance'])
+            cur.execute('SELECT tx_type, method, amount, status FROM transactions WHERE user_id = %s ORDER BY tx_id DESC LIMIT 5', (user.id,))
+            txs = cur.fetchall()
+    history = '\n'.join([f"• {x['tx_type'].title()} ({x['method'].upper()}): {x['amount']} pts [{x['status'].title()}]" for x in txs]) or 'No recent transactions.'
+    text = f'👤 *Player Dashboard*\n\n💰 *Balance:* `{balance}` pts\n\n📜 *Recent Transactions:*\n{history}'
+    keyboard = [[InlineKeyboardButton('📥 Deposit', callback_data='dm_deposit'), InlineKeyboardButton('📤 Withdraw', callback_data='dm_withdraw')], [InlineKeyboardButton('🎮 Play in Group', url=GROUP_LINK)]]
+    markup = InlineKeyboardMarkup(keyboard)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode='Markdown', reply_markup=markup)
+    elif update.message:
+        await update.message.reply_text(text, parse_mode='Markdown', reply_markup=markup)
+
+
+async def dm_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == 'dm_deposit':
+        keyboard = [[InlineKeyboardButton('💳 UPI', callback_data='dep_method:upi')], [InlineKeyboardButton('🪙 USDT BEP-20', callback_data='dep_method:usdt_bep20')]]
+        await q.edit_message_text('Select deposit method:', reply_markup=InlineKeyboardMarkup(keyboard))
+        return DEP_METHOD
+    if q.data == 'dm_withdraw':
+        keyboard = [[InlineKeyboardButton('💳 UPI', callback_data='with_method:upi')], [InlineKeyboardButton('🪙 USDT BEP-20', callback_data='with_method:usdt_bep20')]]
+        await q.edit_message_text('Select withdrawal method:', reply_markup=InlineKeyboardMarkup(keyboard))
+        return WITH_METHOD
+    return ConversationHandler.END
+
+
+async def dep_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    method = q.data.split(':', 1)[1]
+    context.user_data['dep_method'] = method
+    if method == 'upi':
+        address = get_config('upi_id')
+        text = f'📥 *UPI Deposit*\n\nSend payment to:\n`{address}`\n\nEnter the amount of points you deposited.'
+    else:
+        address = get_config('usdt_bep20_address')
+        text = f'📥 *USDT BEP-20 Deposit*\n\nSend USDT to:\n`{address}`\n\nEnter the amount of points you deposited.'
+    await q.edit_message_text(text, parse_mode='Markdown')
+    return DEP_AMOUNT
+
+
+async def dep_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    try:
+        amount = int(update.message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except (ValueError, AttributeError):
+        await update.message.reply_text('Enter a positive whole number.')
+        return DEP_AMOUNT
+    method = context.user_data.get('dep_method')
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('INSERT INTO transactions (user_id, tx_type, method, amount, status) VALUES (%s, %s, %s, %s, %s)', (user.id, 'deposit', method, amount, 'pending'))
+    context.user_data.clear()
+    await update.message.reply_text('✅ Deposit request submitted. Admin approval is required.')
+    await dashboard(update, context)
+    return ConversationHandler.END
+
+
+async def with_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data['with_method'] = q.data.split(':', 1)[1]
+    await q.edit_message_text('Enter the number of points you want to withdraw:')
+    return WITH_AMOUNT
+
+
+async def with_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        amount = int(update.message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except (ValueError, AttributeError):
+        await update.message.reply_text('Enter a positive whole number.')
+        return WITH_AMOUNT
+    user = update.effective_user
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT balance FROM users WHERE user_id = %s', (user.id,))
+            row = cur.fetchone()
+            balance = int(row['balance']) if row else 0
+    if balance < amount:
+        await update.message.reply_text(f'❌ Insufficient funds. Balance: {balance} pts')
+        return ConversationHandler.END
+    context.user_data['with_amount'] = amount
+    method = context.user_data.get('with_method')
+    await update.message.reply_text('Enter your UPI ID:' if method == 'upi' else 'Enter your USDT BEP-20 wallet address:')
+    return WITH_ADDRESS
+
+
+async def with_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    address = update.message.text.strip()
+    amount = context.user_data.get('with_amount')
+    method = context.user_data.get('with_method')
+    if not amount or not method or not address:
+        context.user_data.clear()
+        await update.message.reply_text('Invalid withdrawal request.')
+        return ConversationHandler.END
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT balance FROM users WHERE user_id = %s FOR UPDATE', (user.id,))
+            row = cur.fetchone()
+            if not row or int(row['balance']) < amount:
+                await update.message.reply_text('❌ Insufficient balance.')
+                return ConversationHandler.END
+            cur.execute('UPDATE users SET balance = balance - %s, updated_at = NOW() WHERE user_id = %s', (amount, user.id))
+            cur.execute('INSERT INTO transactions (user_id, tx_type, method, amount, details, status) VALUES (%s, %s, %s, %s, %s, %s)', (user.id, 'withdrawal', method, amount, address, 'pending'))
+    context.user_data.clear()
+    await update.message.reply_text('✅ Withdrawal request submitted. The amount is reserved until admin approval.')
+    await dashboard(update, context)
+    return ConversationHandler.END
+
+
+async def bet_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text('⚠️ Betting is only available in group chats.')
+        return ConversationHandler.END
+    challenger = update.effective_user
+    ensure_user(challenger.id, challenger.username, challenger.first_name)
+    if is_banned(challenger.id):
+        await update.message.reply_text('🚫 You are banned from betting.')
+        return ConversationHandler.END
+    args = context.args or []
+    opponent_id = None
+    opponent_username = None
+    opponent_display = None
+    remaining = args
+    if args and args[0].startswith('@'):
+        opponent_username = args[0][1:]
+        opponent_id = find_user(opponent_username)
+        opponent_display = '@' + opponent_username
+        if opponent_id is None:
+            await update.message.reply_text('❌ That user must use /start first.')
+            return ConversationHandler.END
+        remaining = args[1:]
+    elif update.message.reply_to_message and update.message.reply_to_message.from_user:
+        target = update.message.reply_to_message.from_user
+        if target.is_bot or target.id == challenger.id:
+            await update.message.reply_text('Invalid opponent.')
+            return ConversationHandler.END
+        opponent_id = target.id
+        opponent_username = target.username
+        opponent_display = '@' + target.username if target.username else target.first_name
+        ensure_user(target.id, target.username, target.first_name)
+    else:
+        await update.message.reply_text('Use /bet @username 100 🎲 even or reply to a player message with /bet 100 🎲 even.')
+        return ConversationHandler.END
+    context.user_data['bet_challenge'] = {'opponent_id': opponent_id, 'opponent_username': opponent_username, 'opponent_display': opponent_display, 'challenger_id': challenger.id}
+    if len(remaining) >= 2:
+        try:
+            amount = int(remaining[0])
+            if amount > 0:
+                emoji = next((x for x in remaining[1:] if x in VALID_EMOJIS), '🎲')
+                prediction = next((x.lower() for x in remaining[1:] if x.lower() in ('even', 'odd')), None)
+                if prediction:
+                    if get_balance(challenger.id) < amount:
+                        await update.message.reply_text(f'❌ Insufficient balance. Balance: {get_balance(challenger.id)} pts')
+                        context.user_data.clear()
+                        return ConversationHandler.END
+                    await create_bet(update, context, amount, emoji, prediction)
+                    context.user_data.clear()
+                    return ConversationHandler.END
+        except ValueError:
+            pass
+    await update.message.reply_text('Enter the point amount for this bet:', reply_markup=ForceReply(selective=True))
+    return ASK_AMOUNT
+
+
+async def ask_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        amount = int(update.message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except (ValueError, AttributeError):
+        await update.message.reply_text('Enter a positive whole number.', reply_markup=ForceReply(selective=True))
+        return ASK_AMOUNT
+    if get_balance(update.effective_user.id) < amount:
+        await update.message.reply_text(f'❌ Insufficient balance. Balance: {get_balance(update.effective_user.id)} pts')
+        return ASK_AMOUNT
+    context.user_data['bet_challenge']['amount'] = amount
+    keyboard = [[InlineKeyboardButton(f'{e} {label}', callback_data=f'game:{e}')] for e, label in GAME_EMOJI_LABELS.items()]
+    await update.message.reply_text('Select game:', reply_markup=InlineKeyboardMarkup(keyboard))
+    return ASK_GAME
+
+
+async def ask_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    emoji = q.data.split(':', 1)[1]
+    context.user_data['bet_challenge']['emoji'] = emoji
+    keyboard = [[InlineKeyboardButton('Even', callback_data='pred:even'), InlineKeyboardButton('Odd', callback_data='pred:odd')]]
+    await q.edit_message_text(f'Game: {emoji}\nChoose your prediction:', reply_markup=InlineKeyboardMarkup(keyboard))
+    return ASK_PREDICTION
+
+
+async def ask_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    prediction = q.data.split(':', 1)[1]
+    data = context.user_data.get('bet_challenge', {})
+    amount = data.get('amount')
+    emoji = data.get('emoji')
+    if not amount or not emoji:
+        await q.edit_message_text('❌ Bet setup expired.')
+        context.user_data.clear()
+        return ConversationHandler.END
+    await q.edit_message_text('Creating bet challenge...')
+    await create_bet(update, context, amount, emoji, prediction)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def create_bet(update, context, amount, emoji, prediction):
+    chat_id = update.effective_chat.id
+    challenger = update.effective_user
+    data = context.user_data.get('bet_challenge', {})
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT balance FROM users WHERE user_id = %s FOR UPDATE', (challenger.id,))
+            row = cur.fetchone()
+            if not row or int(row['balance']) < amount:
+                await context.bot.send_message(chat_id, '❌ Insufficient balance.')
+                return
+            cur.execute('INSERT INTO bets (chat_id, challenger_id, challenger_name, opponent_id, opponent_name, amount, emoji, prediction) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING bet_id', (chat_id, challenger.id, challenger.username or challenger.first_name, data.get('opponent_id'), data.get('opponent_username'), amount, emoji, prediction))
+            bet_id = cur.fetchone()['bet_id']
+    text = f"🎲 *Bet #{bet_id} Active!*\n\n👤 Challenger: {challenger.first_name}\n🎯 Target: {data.get('opponent_display')}\n💰 Stake: {amount} pts\n🎮 Game: {emoji}\n🎯 Prediction: {prediction.upper()}\n\nAccept with `/accept {bet_id}`."
+    sent = await context.bot.send_message(chat_id, text, parse_mode='Markdown')
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('UPDATE bets SET challenge_message_id = %s WHERE bet_id = %s', (sent.message_id, bet_id))
+
+
+async def accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text('⚠️ Accept the bet in the group.')
+        return
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text('🚫 You are banned from betting.')
+        return
+    bet_id = None
+    if context.args:
+        try:
+            bet_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text('Invalid bet ID.')
+            return
+    elif update.message.reply_to_message:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT bet_id FROM bets WHERE chat_id = %s AND challenge_message_id = %s AND status = %s', (update.effective_chat.id, update.message.reply_to_message.message_id, 'pending'))
+                row = cur.fetchone()
+                bet_id = row['bet_id'] if row else None
+    if not bet_id:
+        await update.message.reply_text('Use /accept BET_ID or reply to the bet message.')
+        return
+    ensure_user(user.id, user.username, user.first_name)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT * FROM bets WHERE bet_id = %s AND chat_id = %s FOR UPDATE', (bet_id, update.effective_chat.id))
+            bet = cur.fetchone()
+            if not bet or bet['status'] != 'pending':
+                await update.message.reply_text('❌ Bet is unavailable.')
+                return
+            if bet['opponent_id'] and bet['opponent_id'] != user.id:
+                await update.message.reply_text('❌ You are not the designated opponent.')
+                return
+            if bet['challenger_id'] == user.id:
+                await update.message.reply_text('❌ You cannot accept your own bet.')
+                return
+            cur.execute('SELECT balance FROM users WHERE user_id = %s FOR UPDATE', (bet['challenger_id'],))
+            challenger_row = cur.fetchone()
+            cur.execute('SELECT balance FROM users WHERE user_id = %s FOR UPDATE', (user.id,))
+            opponent_row = cur.fetchone()
+            challenger_balance = int(challenger_row['balance']) if challenger_row else 0
+            opponent_balance = int(opponent_row['balance']) if opponent_row else 0
+            amount = int(bet['amount'])
+            if challenger_balance < amount:
+                cur.execute("UPDATE bets SET status = 'cancelled' WHERE bet_id = %s", (bet_id,))
+                await update.message.reply_text('❌ Challenger no longer has enough balance. Bet cancelled.')
+                return
+            if opponent_balance < amount:
+                await update.message.reply_text(f'❌ You need {amount} pts. Your balance is {opponent_balance} pts.')
+                return
+            adjust_balance(conn, bet['challenger_id'], -amount)
+            adjust_balance(conn, user.id, -amount)
+            tax = int(get_config('tax_percent') or '0')
+            cur.execute("UPDATE bets SET status = 'accepted', opponent_id = %s, opponent_name = %s, tax_percent = %s, accepted_at = NOW() WHERE bet_id = %s", (user.id, user.username or user.first_name, tax, bet_id))
+    try:
+        dice = await context.bot.send_dice(chat_id=update.effective_chat.id, emoji=bet['emoji'])
+    except Exception:
+        logger.exception('send_dice failed')
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT * FROM bets WHERE bet_id = %s FOR UPDATE', (bet_id,))
+                current = cur.fetchone()
+                if current and current['status'] == 'accepted':
+                    adjust_balance(conn, current['challenger_id'], current['amount'])
+                    adjust_balance(conn, current['opponent_id'], current['amount'])
+                    cur.execute("UPDATE bets SET status = 'cancelled' WHERE bet_id = %s", (bet_id,))
+        await update.message.reply_text('❌ Game failed to start. Both stakes were refunded.')
+        return
+    value = dice.dice.value
+    outcome = 'even' if value % 2 == 0 else 'odd'
+    winner = bet['challenger_id'] if outcome == bet['prediction'] else user.id
+    pot = int(bet['amount']) * 2
+    tax_percent = int(bet['tax_percent'] or 0)
+    tax_amount = int(pot * tax_percent / 100)
+    payout = pot - tax_amount
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT status FROM bets WHERE bet_id = %s FOR UPDATE', (bet_id,))
+            state = cur.fetchone()
+            if not state or state['status'] != 'accepted':
+                await update.message.reply_text('❌ Bet has already been settled.')
+                return
+            adjust_balance(conn, winner, payout)
+            cur.execute("UPDATE bets SET status = 'resolved', winner_id = %s, dice_value = %s, outcome = %s, tax_amount = %s, payout = %s, resolved_at = NOW() WHERE bet_id = %s", (winner, value, outcome, tax_amount, payout, bet_id))
+    await update.message.reply_text(f"🎯 *Bet #{bet_id} Result*\n\n🎲 Roll: `{value}`\n📊 Outcome: *{outcome.upper()}*\n🏆 Winner: <a href='tg://user?id={winner}'>Player</a>\n💰 Payout: *{payout} pts*\n🏦 Tax: *{tax_amount} pts* ({tax_percent}%)", parse_mode='HTML')
+
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text('❌ Unauthorized.')
+        return
+    keyboard = [[InlineKeyboardButton('⚙️ Tax Rate', callback_data='admin_tax')], [InlineKeyboardButton('🔨 Ban / Unban', callback_data='admin_ban')], [InlineKeyboardButton('💳 Payment Settings', callback_data='admin_gateways')], [InlineKeyboardButton('📑 Financial Queue', callback_data='admin_txs')]]
+    await update.message.reply_text('🔧 *Admin Panel*', parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id not in ADMIN_IDS:
+        await q.answer('Unauthorized', show_alert=True)
+        return ConversationHandler.END
+    await q.answer()
+    if q.data == 'admin_tax':
+        await q.message.reply_text('Enter tax percentage from 0 to 100:', reply_markup=ForceReply(selective=True))
+        return SET_TAX_STATE
+    if q.data == 'admin_ban':
+        await q.message.reply_text('Enter Telegram User ID:', reply_markup=ForceReply(selective=True))
+        return BAN_USER_STATE
+    if q.data == 'admin_gateways':
+        keyboard = [[InlineKeyboardButton('Set UPI ID', callback_data='set_gateway_upi')], [InlineKeyboardButton('Set USDT Address', callback_data='set_gateway_usdt')]]
+        await q.message.reply_text('Choose payment setting:', reply_markup=InlineKeyboardMarkup(keyboard))
+        return ConversationHandler.END
+    if q.data == 'set_gateway_upi':
+        await q.message.reply_text('Enter platform UPI ID:', reply_markup=ForceReply(selective=True))
+        return SET_UPI_STATE
+    if q.data == 'set_gateway_usdt':
+        await q.message.reply_text('Enter platform USDT BEP-20 address:', reply_markup=ForceReply(selective=True))
+        return SET_USDT_STATE
+    if q.data == 'admin_txs':
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT * FROM transactions WHERE status = %s ORDER BY tx_id ASC LIMIT 10', ('pending',))
+                txs = cur.fetchall()
+        if not txs:
+            await q.message.reply_text('✅ Financial queue is empty.')
+            return ConversationHandler.END
+        for tx in txs:
+            details = f"\n📍 Details: `{tx['details']}`" if tx['details'] else ''
+            keyboard = [[InlineKeyboardButton('✅ Approve', callback_data=f"tx_app_{tx['tx_id']}"), InlineKeyboardButton('❌ Reject', callback_data=f"tx_rej_{tx['tx_id']}")]]
+            await q.message.reply_text(f"🧾 *Transaction #{tx['tx_id']}*\n\nUser: `{tx['user_id']}`\nType: `{tx['tx_type'].upper()}`\nMethod: `{tx['method'].upper()}`\nAmount: *{tx['amount']} pts*{details}", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+        return ConversationHandler.END
+    return ConversationHandler.END
+
+
+async def tx_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id not in ADMIN_IDS:
+        await q.answer('Unauthorized', show_alert=True)
+        return
+    try:
+        _, action, tx_id_text = q.data.split('_')
+        tx_id = int(tx_id_text)
+    except Exception:
+        await q.answer('Invalid transaction', show_alert=True)
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT * FROM transactions WHERE tx_id = %s FOR UPDATE', (tx_id,))
+            tx = cur.fetchone()
+            if not tx or tx['status'] != 'pending':
+                await q.answer('Already processed or not found', show_alert=True)
+                return
+            if action == 'app':
+                new_status = 'approved'
+                if tx['tx_type'] == 'deposit':
+                    adjust_balance(conn, tx['user_id'], tx['amount'])
+            else:
+                new_status = 'rejected'
+                if tx['tx_type'] == 'withdrawal':
+                    adjust_balance(conn, tx['user_id'], tx['amount'])
+            cur.execute('UPDATE transactions SET status = %s, processed_at = NOW(), processed_by = %s WHERE tx_id = %s', (new_status, q.from_user.id, tx_id))
+    await q.answer(f'Transaction {new_status}')
+    await q.edit_message_text(f'✅ Transaction #{tx_id}: *{new_status.upper()}*', parse_mode='Markdown')
+
+
+async def set_tax(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        value = int(update.message.text.strip())
+        if value < 0 or value > 100:
+            raise ValueError
+    except (ValueError, AttributeError):
+        await update.message.reply_text('Enter a whole number from 0 to 100.')
+        return SET_TAX_STATE
+    set_config('tax_percent', str(value))
+    await update.message.reply_text(f'✅ Tax set to {value}%.')
+    return ConversationHandler.END
+
+
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = int(update.message.text.strip())
+    except (ValueError, AttributeError):
+        await update.message.reply_text('Enter a numeric Telegram User ID.')
+        return BAN_USER_STATE
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT is_banned FROM users WHERE user_id = %s FOR UPDATE', (user_id,))
+            row = cur.fetchone()
+            if not row:
+                await update.message.reply_text('❌ User not found. They must use /start first.')
+                return ConversationHandler.END
+            new_state = not bool(row['is_banned'])
+            cur.execute('UPDATE users SET is_banned = %s, updated_at = NOW() WHERE user_id = %s', (new_state, user_id))
+    await update.message.reply_text(f"✅ User {user_id}: {'BANNED' if new_state else 'UNBANNED'}")
+    return ConversationHandler.END
+
+
+async def set_upi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    value = update.message.text.strip()
+    if not value:
+        await update.message.reply_text('UPI ID cannot be empty.')
+        return SET_UPI_STATE
+    set_config('upi_id', value)
+    await update.message.reply_text('✅ UPI ID updated.')
+    return ConversationHandler.END
+
+
+async def set_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    value = update.message.text.strip()
+    if not value:
+        await update.message.reply_text('USDT address cannot be empty.')
+        return SET_USDT_STATE
+    set_config('usdt_bep20_address', value)
+    await update.message.reply_text('✅ USDT BEP-20 address updated.')
+    return ConversationHandler.END
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'OK')
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    port = int(os.environ.get('PORT', '10000'))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info('Health server started on port %s', port)
+
+
+def main():
+    require_config()
+    init_db()
+    start_health_server()
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    dm_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(dm_actions, pattern=r'^dm_')],
+        states={
+            DEP_METHOD: [CallbackQueryHandler(dep_method, pattern=r'^dep_method:')],
+            DEP_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, dep_amount)],
+            WITH_METHOD: [CallbackQueryHandler(with_method, pattern=r'^with_method:')],
+            WITH_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, with_amount)],
+            WITH_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, with_address)],
+        },
+        fallbacks=[],
+        allow_reentry=True,
+    )
+
+    bet_conv = ConversationHandler(
+        entry_points=[CommandHandler('bet', bet_start)],
+        states={
+            ASK_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_amount)],
+            ASK_GAME: [CallbackQueryHandler(ask_game, pattern=r'^game:')],
+            ASK_PREDICTION: [CallbackQueryHandler(ask_prediction, pattern=r'^pred:')],
+        },
+        fallbacks=[],
+        allow_reentry=True,
+    )
+
+    admin_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_callback, pattern=r'^(admin_|set_gateway_)')],
+        states={
+            SET_TAX_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_tax)],
+            BAN_USER_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ban_user)],
+            SET_UPI_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_upi)],
+            SET_USDT_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_usdt)],
+        },
+        fallbacks=[],
+        allow_reentry=True,
+    )
+
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('wallet', start))
+    app.add_handler(CommandHandler('admin', admin_panel))
+    app.add_handler(CommandHandler('accept', accept_cmd))
+    app.add_handler(dm_conv)
+    app.add_handler(bet_conv)
+    app.add_handler(admin_conv)
+    app.add_handler(CallbackQueryHandler(tx_approval, pattern=r'^tx_'))
+
+    logger.info('Bot starting...')
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == '__main__':
+    main()
 # ============================================================================
 # CONVERSATION STATES
 # ============================================================================
