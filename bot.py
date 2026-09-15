@@ -1,21 +1,38 @@
 """
 Player-vs-Player Betting Bot for Telegram
 =========================================
+
 Features:
-1. Distinct Group vs. DM contexts (Group = Gameplay, DM = User Dashboard & Wallet).
-2. DM Dashboard displaying balance, history, deposits, withdrawals, and group play link.
-3. Multiple deposit & withdrawal options (USDT BEP-20 & UPI).
-4. Full SQLite database schema.
-5. Interactive Admin Panel (Taxation, Ban/Unban, Payment Gateway Config, Transaction Approvals).
+1. Group = gameplay
+2. DM = wallet/dashboard
+3. Persistent PostgreSQL database
+4. Deposits: UPI / USDT BEP-20
+5. Withdrawals: UPI / USDT BEP-20
+6. Admin panel
+7. Tax configuration
+8. Ban / unban users
+9. Transaction approval
+10. Persistent bets and balances
+11. Render-compatible health server
+
+IMPORTANT:
+Set these environment variables on Render:
+
+BOT_TOKEN
+DATABASE_URL
+ADMIN_IDS
+GROUP_LINK
 """
 
 import logging
 import os
-import sqlite3
 import threading
-from contextlib import closing
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from telegram import (
     ForceReply,
@@ -33,18 +50,44 @@ from telegram.ext import (
     filters,
 )
 
-# Logging Setup
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
 logger = logging.getLogger(__name__)
 
-# Config & Environment Settings
-DB_PATH = os.path.join(os.path.dirname(__file__), "bet_bot.db")
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
 STARTING_BALANCE = 1000
-ADMIN_IDS = [int(i) for i in os.environ.get("ADMIN_IDS", "").split(",") if i.isdigit()]
-GROUP_LINK = os.environ.get("GROUP_LINK", "https://t.me/your_group_link")
+
+ADMIN_IDS = [
+    int(i.strip())
+    for i in os.environ.get("ADMIN_IDS", "").split(",")
+    if i.strip().isdigit()
+]
+
+GROUP_LINK = os.environ.get(
+    "GROUP_LINK",
+    "https://t.me/your_group_link",
+)
+
+
+# ============================================================================
+# GAME CONFIGURATION
+# ============================================================================
 
 GAME_EMOJI_LABELS = {
     "🎲": "Dice",
@@ -54,9 +97,14 @@ GAME_EMOJI_LABELS = {
     "⚽": "Football",
     "🎰": "Slots",
 }
+
 VALID_EMOJIS = set(GAME_EMOJI_LABELS.keys())
 
-# Conversation States
+
+# ============================================================================
+# CONVERSATION STATES
+# ============================================================================
+
 (
     ASK_AMOUNT,
     ASK_GAME,
@@ -73,35 +121,186 @@ VALID_EMOJIS = set(GAME_EMOJI_LABELS.keys())
 ) = range(12)
 
 
-# ---------------------------------------------------------------------------
-# Database Management Layer
-# ---------------------------------------------------------------------------
+# ============================================================================
+# DATABASE
+# ============================================================================
 
+@contextmanager
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """
+    PostgreSQL database connection.
+
+    Every transaction is committed automatically if successful.
+    If an exception occurs, the transaction is rolled back.
+    """
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is not configured."
+        )
+
+    conn = None
+
+    try:
+        conn = psycopg2.connect(
+            DATABASE_URL,
+            cursor_factory=RealDictCursor,
+        )
+
+        yield conn
+
+        conn.commit()
+
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+
+    finally:
+        if conn:
+            conn.close()
 
 
 def init_db():
-    with closing(get_conn()) as conn:
-        # User Accounts
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                balance INTEGER NOT NULL DEFAULT 1000,
-                is_banned INTEGER NOT NULL DEFAULT 0
+    """
+    Create all required PostgreSQL tables.
+    """
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            # ----------------------------------------------------------------
+            # USERS
+            # ----------------------------------------------------------------
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    balance BIGINT NOT NULL DEFAULT 1000,
+                    is_banned BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
             )
-            """
-        )
-        # Bets Engine
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS bets (
-                bet_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
+
+            # ----------------------------------------------------------------
+            # BETS
+            # ----------------------------------------------------------------
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bets (
+                    bet_id BIGSERIAL PRIMARY KEY,
+
+                    chat_id BIGINT NOT NULL,
+
+                    challenger_id BIGINT NOT NULL,
+                    challenger_name TEXT,
+
+                    opponent_id BIGINT,
+                    opponent_name TEXT,
+
+                    amount BIGINT NOT NULL,
+
+                    emoji TEXT NOT NULL DEFAULT '🎲',
+
+                    prediction TEXT NOT NULL,
+
+                    status TEXT NOT NULL DEFAULT 'pending',
+
+                    winner_id BIGINT,
+
+                    challenge_message_id BIGINT,
+
+                    dice_value INTEGER,
+
+                    outcome TEXT,
+
+                    tax_percent INTEGER DEFAULT 0,
+
+                    tax_amount BIGINT DEFAULT 0,
+
+                    payout BIGINT DEFAULT 0,
+
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    accepted_at TIMESTAMPTZ,
+                    resolved_at TIMESTAMPTZ
+                )
+                """
+            )
+
+            # ----------------------------------------------------------------
+            # TRANSACTIONS
+            # ----------------------------------------------------------------
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transactions (
+                    tx_id BIGSERIAL PRIMARY KEY,
+
+                    user_id BIGINT NOT NULL,
+
+                    tx_type TEXT NOT NULL,
+
+                    method TEXT NOT NULL,
+
+                    amount BIGINT NOT NULL,
+
+                    details TEXT,
+
+                    status TEXT NOT NULL DEFAULT 'pending',
+
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+                    processed_at TIMESTAMPTZ,
+
+                    processed_by BIGINT
+                )
+                """
+            )
+
+            # ----------------------------------------------------------------
+            # SYSTEM CONFIG
+            # ----------------------------------------------------------------
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS system_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+
+            # ----------------------------------------------------------------
+            # DEFAULT CONFIG
+            # ----------------------------------------------------------------
+
+            cur.execute(
+                """
+                INSERT INTO system_config (key, value)
+                VALUES ('tax_percent', '0')
+                ON CONFLICT (key) DO NOTHING
+                """
+            )
+
+            cur.execute(
+                """
+                INSERT INTO system_config (key, value)
+                VALUES ('upi_id', 'not_set@upi')
+                ON CONFLICT (key) DO NOTHING
+                """
+            )
+
+            cur.execute(
+                """
+                INSERT INTO system_config (key, value)
+                VALUES (
+                    'usdt_bep20_address',
+                    '0x000000000000000000000000000000000000000                chat_id INTEGER NOT NULL,
                 challenger_id INTEGER NOT NULL,
                 challenger_name TEXT,
                 opponent_id INTEGER,
