@@ -1,40 +1,43 @@
 """
-BlockVerse-BOT - Player-vs-Player Telegram Betting Bot (aiogram edition)
-=========================================================================
+Player-vs-Player Betting Bot for Telegram with Native Dice & Automatic Settlement
+=================================================================================
 
-Wallet:
-🏦 Your Wallet
+GROUP CHATS: playing only.
+    /bet @opponent            - or reply to someone's message with /bet
+    /bet @opponent 100 🎲 even - fast path, skips the button flow
+    /accept                   - reply to the bot's challenge message
+    /accept <bet_id>          - or accept by id
+    /cancel <bet_id>          - cancel your own unaccepted bet
+    /mybets                   - your open/pending bets in this chat
+    /leaderboard              - top balances among players active in this chat
 
-💵 Balance: $0
-❌ UPI: Not saved yet
+DM WITH THE BOT: account management only.
+    /balance                  - wallet balance, recent deposit/withdrawal/win/loss
+                                history, and buttons to jump back into your groups
 
-Min withdrawal: $2
+ADMIN PANEL (any chat, admin-only):
+    /ban <@user|id>           - stop a player from betting/accepting
+    /unban <@user|id>
+    /deposit <@user|id> <amt> - credit a player's wallet
+    /withdraw <@user|id> <amt>- debit a player's wallet
+    /settax <percent>         - house cut taken from every payout (0-100)
+    /tax                      - show current tax rate (anyone can check)
+    /housebalance             - total tax collected so far
+    /addadmin <user_id>       - grant admin rights to another user
 
-Inline keyboard:
-Row 1: 🟢 Deposit | 🔵 Withdrawal
-Row 2: 🔵 History | 🔵 Usage
-Row 3: Official Group
+IMPORTANT SCOPE NOTE:
+Deposit/withdraw here are admin-controlled ledger adjustments only. This bot
+does NOT integrate any real payment processor (UPI, bank, card, crypto). If
+real money is meant to back these points, that exchange has to happen outside
+the bot, with an admin then reflecting it via /deposit or /withdraw. Wiring
+real money movement directly into a peer-to-peer wagering bot would make this
+an unlicensed gambling service in most jurisdictions, which is not something
+this code should do.
 
-Notes:
-- Rebuilt on aiogram 3.x (Bot / Dispatcher / Router / F / FSMContext /
-  StatesGroup / InlineKeyboardBuilder / ReplyKeyboardBuilder), matching the
-  conventions of the reference bot: HTML parse mode, a `style=` hint
-  ("success" / "danger" / "primary") on every button, and a persistent
-  Reply-keyboard admin console instead of a single inline admin message.
-- The Telegram Bot API itself has no concept of inline-button background
-  colour — that's controlled entirely by the Telegram client/theme, on
-  aiogram just as it was on python-telegram-bot. The `style=` kwarg is kept
-  purely as a self-documenting hint and is stripped out (via `add_button()`)
-  before the button is actually sent, so it can never trip up aiogram/
-  pydantic validation; the emoji prefix (🟢/🔵/🔴) is what actually conveys
-  "success / primary / danger" to the user.
-- SQLite database is persistent on the same disk. Money is stored as whole
-  dollars in this version. All DB access stays synchronous (sqlite3) since
-  it's local-disk and single-process; each call is short-lived enough not
-  to block the event loop in any meaningful way for this bot's scale.
+Initial admin(s) are bootstrapped from the ADMIN_USER_IDS environment
+variable (comma-separated Telegram numeric user IDs) on first run.
 """
 
-import asyncio
 import logging
 import os
 import sqlite3
@@ -43,25 +46,23 @@ from contextlib import closing
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    CallbackQuery,
+from telegram import (
     ForceReply,
+    InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Message,
-    ReplyKeyboardRemove,
+    Update,
 )
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+from telegram.constants import ChatType
+from telegram.error import Forbidden
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -69,33 +70,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise SystemExit("Fatal Error: BOT_TOKEN environment variable not set.")
-
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bet_bot.db")
-
-# New users start at $0 as requested.
-STARTING_BALANCE = 0
-MIN_WITHDRAWAL = 2
-
-ADMIN_IDS = [
-    int(i.strip())
-    for i in os.environ.get("ADMIN_IDS", "").split(",")
-    if i.strip().isdigit()
-]
-
-GROUP_LINK = os.environ.get("GROUP_LINK", "https://t.me/your_group_link")
-
-# Global bot on/off switch (admin-controlled) - mirrors the reference bot's
-# BOT_STATUS flag. Admins can always use the bot even while it's OFF.
-BOT_STATUS = True
-BOT_OFF_MESSAGE = "⚠️ Bot is currently OFF for maintenance. Please wait for an admin to turn it back on."
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-router = Router()
-dp.include_router(router)
+DB_PATH = os.path.join(os.path.dirname(__file__), "bet_bot.db")
+STARTING_BALANCE = 1000
+DEFAULT_TAX_PERCENT = 0.0
+HOUSE_ACCOUNT_ID = 0  # pseudo user_id used only in the transactions ledger
 
 GAME_EMOJI_LABELS = {
     "🎲": "Dice",
@@ -105,102 +83,64 @@ GAME_EMOJI_LABELS = {
     "⚽": "Football",
     "🎰": "Slots",
 }
-VALID_EMOJIS = set(GAME_EMOJI_LABELS)
+VALID_EMOJIS = set(GAME_EMOJI_LABELS.keys())
 
-# Reply-keyboard button labels that belong to the admin console, so plain
-# text handlers never mistake them for FSM input (mirrors the reference
-# bot's MENU_BUTTONS guard against state bleeding).
-ADMIN_MENU_BUTTONS = {
-    "⚙️ Set Tax Rate",
-    "🚫 Ban User",
-    "✅ Unban User",
-    "💳 Payment Gateways",
-    "📑 Pending Transactions",
-    "➕ Add Balance",
-    "➖ Cut Balance",
-    "🔎 Check Balance",
-    "🏆 Top Balances",
-    "🔍 Find ID",
-    "📢 Broadcast",
-    "📊 View Stats",
-    "🟢 Bot Status: ON",
-    "🔴 Bot Status: OFF",
-    "🏠 Main Menu",
-}
+ASK_AMOUNT, ASK_GAME, ASK_PREDICTION = range(3)
 
 
 # ---------------------------------------------------------------------------
-# FSM States
-# ---------------------------------------------------------------------------
-
-class WalletStates(StatesGroup):
-    dep_amount = State()
-    with_amount = State()
-    with_address = State()
-
-
-class BetStates(StatesGroup):
-    ask_amount = State()
-    ask_game = State()
-    ask_prediction = State()
-
-
-class AdminStates(StatesGroup):
-    set_tax = State()
-    ban_user = State()
-    unban_user = State()
-    set_upi = State()
-    set_usdt = State()
-    add_balance_id = State()
-    add_balance_amount = State()
-    cut_balance_id = State()
-    cut_balance_amount = State()
-    check_balance = State()
-    find_id = State()
-    broadcast = State()
-
-
-# ---------------------------------------------------------------------------
-# Database
+# Database helpers
 # ---------------------------------------------------------------------------
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
-
-def column_exists(conn, table_name, column_name):
-    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return any(row["name"] == column_name for row in rows)
 
 
 def init_db():
     with closing(get_conn()) as conn:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS users (
+            CREATE TABLE IF NOT EXISTS wallets (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                first_name TEXT,
-                balance INTEGER NOT NULL DEFAULT 0,
-                upi_id TEXT,
-                is_banned INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT,
-                updated_at TEXT
+                balance INTEGER NOT NULL DEFAULT 1000,
+                banned INTEGER NOT NULL DEFAULT 0
             )
             """
         )
-
-        if not column_exists(conn, "users", "first_name"):
-            conn.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
-        if not column_exists(conn, "users", "upi_id"):
-            conn.execute("ALTER TABLE users ADD COLUMN upi_id TEXT")
-        if not column_exists(conn, "users", "created_at"):
-            conn.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
-        if not column_exists(conn, "users", "updated_at"):
-            conn.execute("ALTER TABLE users ADD COLUMN updated_at TEXT")
-
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transactions (
+                tx_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                type TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                admin_id INTEGER,
+                note TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS group_players (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                chat_title TEXT,
+                chat_username TEXT,
+                PRIMARY KEY (chat_id, user_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)"
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS bets (
@@ -215,878 +155,343 @@ def init_db():
                 prediction TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 winner_id INTEGER,
+                tax_amount INTEGER DEFAULT 0,
                 challenge_message_id INTEGER,
                 created_at TEXT
             )
             """
         )
+        conn.commit()
 
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS transactions (
-                tx_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                tx_type TEXT NOT NULL,
-                method TEXT NOT NULL,
-                amount INTEGER NOT NULL,
-                details TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TEXT
-            )
-            """
-        )
+        # Migrations for DBs created by earlier versions of this bot
+        for stmt in (
+            "ALTER TABLE bets ADD COLUMN challenge_message_id INTEGER",
+            "ALTER TABLE bets ADD COLUMN tax_amount INTEGER DEFAULT 0",
+        ):
+            try:
+                conn.execute(stmt)
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS system_config (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
 
-        conn.execute(
-            "INSERT OR IGNORE INTO system_config (key, value) VALUES ('tax_percent', '0')"
-        )
-        conn.execute(
-            "INSERT OR IGNORE INTO system_config (key, value) VALUES ('upi_id', 'not_set@upi')"
-        )
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO system_config (key, value)
-            VALUES ('usdt_bep20_address', '0x0000000000000000000000000000000000000000')
-            """
-        )
-
+def bootstrap_admins():
+    raw = os.environ.get("ADMIN_USER_IDS", "")
+    ids = [x.strip() for x in raw.split(",") if x.strip()]
+    if not ids:
+        logger.warning("ADMIN_USER_IDS not set - no admins configured yet.")
+        return
+    with closing(get_conn()) as conn:
+        for item in ids:
+            try:
+                uid = int(item)
+            except ValueError:
+                continue
+            conn.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (uid,))
         conn.commit()
 
 
-def ensure_user(conn, user_id, username=None, first_name=None):
-    now = datetime.utcnow().isoformat()
-    row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+# ---- Wallet / ledger -------------------------------------------------------
 
+def ensure_wallet(conn, user_id, username):
+    row = conn.execute("SELECT * FROM wallets WHERE user_id=?", (user_id,)).fetchone()
     if row is None:
         conn.execute(
-            """
-            INSERT INTO users
-            (user_id, username, first_name, balance, is_banned, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 0, ?, ?)
-            """,
-            (user_id, username, first_name, STARTING_BALANCE, now, now),
+            "INSERT INTO wallets (user_id, username, balance, banned) VALUES (?, ?, ?, 0)",
+            (user_id, username, STARTING_BALANCE),
         )
         conn.commit()
-        return STARTING_BALANCE, 0
+        _log_tx(conn, user_id, "signup_bonus", STARTING_BALANCE, note="Starting balance")
+        return conn.execute("SELECT * FROM wallets WHERE user_id=?", (user_id,)).fetchone()
+    if username and row["username"] != username:
+        conn.execute("UPDATE wallets SET username=? WHERE user_id=?", (username, user_id))
+        conn.commit()
+        row = conn.execute("SELECT * FROM wallets WHERE user_id=?", (user_id,)).fetchone()
+    return row
 
+
+def get_wallet(conn, user_id):
+    return conn.execute("SELECT * FROM wallets WHERE user_id=?", (user_id,)).fetchone()
+
+
+def is_banned(conn, user_id):
+    row = get_wallet(conn, user_id)
+    return bool(row and row["banned"])
+
+
+def _log_tx(conn, user_id, tx_type, amount, admin_id=None, note=None):
     conn.execute(
-        "UPDATE users SET username=?, first_name=?, updated_at=? WHERE user_id=?",
-        (username, first_name, now, user_id),
+        "INSERT INTO transactions (user_id, type, amount, admin_id, note, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, tx_type, amount, admin_id, note, datetime.utcnow().isoformat()),
     )
     conn.commit()
-    return row["balance"], row["is_banned"]
 
 
-def is_user_banned(conn, user_id):
-    row = conn.execute("SELECT is_banned FROM users WHERE user_id=?", (user_id,)).fetchone()
-    return bool(row and row["is_banned"])
+def adjust_wallet(conn, user_id, delta, tx_type, admin_id=None, note=None):
+    conn.execute("UPDATE wallets SET balance = balance + ? WHERE user_id=?", (delta, user_id))
+    conn.commit()
+    _log_tx(conn, user_id, tx_type, delta, admin_id=admin_id, note=note)
 
 
-def get_balance(conn, user_id):
-    row = conn.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
-    return int(row["balance"]) if row else 0
-
-
-def adjust_balance(conn, user_id, delta):
+def register_group_player(conn, chat_id, chat_title, chat_username, user_id, username):
     conn.execute(
-        "UPDATE users SET balance = balance + ?, updated_at = ? WHERE user_id = ?",
-        (delta, datetime.utcnow().isoformat(), user_id),
-    )
-
-
-def get_user_upi(conn, user_id):
-    row = conn.execute("SELECT upi_id FROM users WHERE user_id=?", (user_id,)).fetchone()
-    return row["upi_id"] if row and row["upi_id"] else None
-
-
-def save_user_upi(conn, user_id, upi_id):
-    conn.execute(
-        "UPDATE users SET upi_id=?, updated_at=? WHERE user_id=?",
-        (upi_id, datetime.utcnow().isoformat(), user_id),
-    )
-
-
-def find_user_id_by_username(conn, username):
-    username = username.lstrip("@")
-    row = conn.execute(
-        "SELECT user_id FROM users WHERE username=? COLLATE NOCASE",
-        (username,),
-    ).fetchone()
-    return row["user_id"] if row else None
-
-
-def get_config_val(conn, key):
-    row = conn.execute("SELECT value FROM system_config WHERE key=?", (key,)).fetchone()
-    return row["value"] if row else ""
-
-
-def set_config_val(conn, key, value):
-    conn.execute("UPDATE system_config SET value=? WHERE key=?", (value, key))
-
-
-def all_user_ids(conn):
-    return [r["user_id"] for r in conn.execute("SELECT user_id FROM users").fetchall()]
-
-
-def stats_snapshot(conn):
-    total_users = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
-    banned_users = conn.execute("SELECT COUNT(*) AS c FROM users WHERE is_banned=1").fetchone()["c"]
-    total_balance = conn.execute("SELECT COALESCE(SUM(balance), 0) AS s FROM users").fetchone()["s"]
-    total_bets = conn.execute("SELECT COUNT(*) AS c FROM bets").fetchone()["c"]
-    resolved_bets = conn.execute("SELECT COUNT(*) AS c FROM bets WHERE status='resolved'").fetchone()["c"]
-    pending_tx = conn.execute("SELECT COUNT(*) AS c FROM transactions WHERE status='pending'").fetchone()["c"]
-    return {
-        "total_users": total_users,
-        "banned_users": banned_users,
-        "total_balance": total_balance,
-        "total_bets": total_bets,
-        "resolved_bets": resolved_bets,
-        "pending_tx": pending_tx,
-    }
-
-
-def top_balances(conn, limit=10):
-    return conn.execute(
         """
-        SELECT user_id, username, first_name, balance
-        FROM users
-        ORDER BY balance DESC
-        LIMIT ?
+        INSERT INTO group_players (chat_id, user_id, username, chat_title, chat_username)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id, user_id) DO UPDATE SET
+            username=excluded.username,
+            chat_title=excluded.chat_title,
+            chat_username=excluded.chat_username
         """,
-        (limit,),
-    ).fetchall()
+        (chat_id, user_id, username, chat_title, chat_username),
+    )
+    conn.commit()
+
+
+def resolve_user_ref(conn, ref):
+    """Resolve '@username' or a numeric id to a user_id, or None if unknown."""
+    ref = ref.strip()
+    if ref.startswith("@"):
+        uname = ref[1:].lower()
+        row = conn.execute(
+            "SELECT user_id FROM wallets WHERE lower(username)=?", (uname,)
+        ).fetchone()
+        return row["user_id"] if row else None
+    try:
+        return int(ref)
+    except ValueError:
+        return None
+
+
+def is_admin(conn, user_id):
+    return conn.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,)).fetchone() is not None
+
+
+def get_setting(conn, key, default=None):
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(conn, key, value):
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value)),
+    )
+    conn.commit()
+
+
+def get_tax_percent(conn):
+    return float(get_setting(conn, "tax_percent", DEFAULT_TAX_PERCENT))
 
 
 # ---------------------------------------------------------------------------
-# Styled button helpers (aiogram InlineKeyboardBuilder / ReplyKeyboardBuilder)
-# ---------------------------------------------------------------------------
-#
-# Every button below is built through `add_button()`, carrying a `style=`
-# hint ("success" / "danger" / "primary") - the same self-documenting
-# convention the reference bot uses so it's obvious at a glance which
-# buttons are "positive", "negative" and "neutral" actions. The Bot API
-# gives no way to actually recolor an inline button's background - that's
-# entirely the Telegram client/theme's job - so `style=` is intentionally
-# stripped out here before the button is handed to aiogram, rather than
-# forwarded into the real button object (some aiogram/pydantic builds
-# reject unknown keyword arguments outright). What the user actually SEES
-# as "colour" is the 🟢/🔵/🔴 emoji prefix baked into each button's text.
-
-def add_button(kb, *, text: str, style: str = "primary", callback_data: str = None, url: str = None):
-    kwargs = {"text": text}
-    if callback_data is not None:
-        kwargs["callback_data"] = callback_data
-    if url is not None:
-        kwargs["url"] = url
-    kb.button(**kwargs)
-
-
-def wallet_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    add_button(kb, text="🟢 Deposit", callback_data="wallet:deposit", style="success")
-    add_button(kb, text="🔵 Withdrawal", callback_data="wallet:withdraw", style="primary")
-    add_button(kb, text="🔵 History", callback_data="wallet:history", style="primary")
-    add_button(kb, text="🔵 Usage", callback_data="wallet:usage", style="primary")
-    add_button(kb, text="Official Group", url=GROUP_LINK, style="primary")
-    kb.adjust(2, 2, 1)
-    return kb.as_markup()
-
-
-def back_to_wallet_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    add_button(kb, text="⬅️ Back to Wallet", callback_data="wallet:back", style="primary")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-def deposit_method_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    add_button(kb, text="💳 UPI", callback_data="dep_method:upi", style="primary")
-    add_button(kb, text="🪙 USDT BEP-20", callback_data="dep_method:usdt_bep20", style="primary")
-    add_button(kb, text="⬅️ Back", callback_data="wallet:back", style="danger")
-    kb.adjust(2, 1)
-    return kb.as_markup()
-
-
-def withdraw_method_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    add_button(kb, text="💳 UPI", callback_data="with_method:upi", style="primary")
-    add_button(kb, text="🪙 USDT BEP-20", callback_data="with_method:usdt_bep20", style="primary")
-    add_button(kb, text="⬅️ Back", callback_data="wallet:back", style="danger")
-    kb.adjust(2, 1)
-    return kb.as_markup()
-
-
-def tx_approval_keyboard(tx_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    add_button(kb, text="✅ Approve", callback_data=f"tx:app:{tx_id}", style="success")
-    add_button(kb, text="❌ Decline", callback_data=f"tx:rej:{tx_id}", style="danger")
-    kb.adjust(2)
-    return kb.as_markup()
-
-
-def game_select_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    for emoji, label in GAME_EMOJI_LABELS.items():
-        add_button(kb, text=f"{emoji} {label}", callback_data=f"game:{emoji}", style="primary")
-    kb.adjust(2)
-    return kb.as_markup()
-
-
-def prediction_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    add_button(kb, text="⬆️ Even", callback_data="pred:even", style="primary")
-    add_button(kb, text="⬇️ Odd", callback_data="pred:odd", style="primary")
-    kb.adjust(2)
-    return kb.as_markup()
-
-
-def admin_entry_keyboard() -> InlineKeyboardMarkup:
-    """Sent as a one-off inline reply to /admin, then swaps the user over
-    to the persistent Reply-keyboard console below."""
-    kb = InlineKeyboardBuilder()
-    add_button(kb, text="🔧 Open Admin Console", callback_data="admin:open", style="primary")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-def gateway_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    add_button(kb, text="💳 Set UPI ID", callback_data="gateway:upi", style="primary")
-    add_button(kb, text="🪙 Set USDT Address", callback_data="gateway:usdt", style="primary")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-def get_admin_menu_keyboard():
-    """Persistent Reply keyboard admin console - mirrors the reference
-    bot's `get_admin_menu_keyboard()`, adapted to what this betting bot
-    actually needs (tax, bans, gateways, tx queue, balances, broadcast,
-    stats, bot status)."""
-    kb = ReplyKeyboardBuilder()
-
-    add_button(kb, text="⚙️ Set Tax Rate", style="primary")
-    add_button(kb, text="💳 Payment Gateways", style="primary")
-
-    add_button(kb, text="📑 Pending Transactions", style="primary")
-    add_button(kb, text="📊 View Stats", style="primary")
-
-    add_button(kb, text="➕ Add Balance", style="success")
-    add_button(kb, text="➖ Cut Balance", style="danger")
-
-    add_button(kb, text="🔎 Check Balance", style="primary")
-    add_button(kb, text="🏆 Top Balances", style="primary")
-
-    add_button(kb, text="🚫 Ban User", style="danger")
-    add_button(kb, text="✅ Unban User", style="success")
-
-    add_button(kb, text="🔍 Find ID", style="primary")
-    add_button(kb, text="📢 Broadcast", style="primary")
-
-    status_text = "🟢 Bot Status: ON" if BOT_STATUS else "🔴 Bot Status: OFF"
-    add_button(kb, text=status_text, style="success" if BOT_STATUS else "danger")
-
-    add_button(kb, text="🏠 Main Menu", style="primary")
-
-    kb.adjust(2, 2, 2, 2, 2, 2, 1, 1)
-    return kb.as_markup(resize_keyboard=True)
-
-
-# ---------------------------------------------------------------------------
-# Gate: bot on/off + ban check (applied per-handler, admins bypass)
+# Chat-type helpers
 # ---------------------------------------------------------------------------
 
-async def is_blocked(message_or_query, user_id: int) -> bool:
-    """Returns True (and replies) if this user should not proceed - either
-    the bot is globally OFF (admins exempt) or the user is banned."""
-    is_admin = user_id in ADMIN_IDS
+def is_group_chat(update: Update) -> bool:
+    return update.effective_chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
 
-    if not BOT_STATUS and not is_admin:
-        await _reply(message_or_query, BOT_OFF_MESSAGE)
+
+def is_private_chat(update: Update) -> bool:
+    return update.effective_chat.type == ChatType.PRIVATE
+
+
+async def _require_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if is_group_chat(update):
         return True
-
-    with closing(get_conn()) as conn:
-        if is_user_banned(conn, user_id):
-            await _reply(message_or_query, "🚫 You are banned from using this bot.")
-            return True
-
+    await update.effective_message.reply_text(
+        "🎮 Betting only happens in group chats — add me to a group and play there.\n"
+        "Use /balance right here to check your wallet."
+    )
     return False
 
 
-async def _reply(message_or_query, text: str, **kwargs):
-    if isinstance(message_or_query, CallbackQuery):
-        await message_or_query.answer()
-        try:
-            await message_or_query.message.edit_text(text, **kwargs)
-        except TelegramBadRequest:
-            await message_or_query.message.answer(text, **kwargs)
-    else:
-        await message_or_query.answer(text, **kwargs)
+async def _require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    with closing(get_conn()) as conn:
+        ok = is_admin(conn, update.effective_user.id)
+    if not ok:
+        await update.effective_message.reply_text("⛔ Admins only.")
+    return ok
 
 
-# ---------------------------------------------------------------------------
-# Real-time notifications: admin (new tx) <-> user (tx result)
-# ---------------------------------------------------------------------------
-
-async def notify_admins_new_tx(tx_id, tx_type, user, method, amount, details=None):
-    """Push a real-time notification to every admin as soon as a deposit or
-    withdrawal request is created, with inline Approve/Decline buttons so
-    it can be actioned immediately without opening the admin console."""
-    if not ADMIN_IDS:
-        return
-
-    label = "📥 <b>New Deposit Request</b>" if tx_type == "deposit" else "📤 <b>New Withdrawal Request</b>"
-    username = f"@{user.username}" if user.username else (user.first_name or "Unknown")
-    detail_line = f"\nAddress/UPI: <code>{details}</code>" if details else ""
-
-    text = (
-        f"{label}\n\n"
-        f"Tx ID: #{tx_id}\n"
-        f"User: {username} (<code>{user.id}</code>)\n"
-        f"Method: {method.upper()}\n"
-        f"Amount: ${amount}"
-        f"{detail_line}"
-    )
-
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                chat_id=admin_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=tx_approval_keyboard(tx_id),
-            )
-        except (TelegramForbiddenError, TelegramBadRequest):
-            logger.exception("Failed to notify admin %s of new tx #%s", admin_id, tx_id)
-
-
-async def notify_user_tx_result(tx):
-    """Push a real-time notification to the user as soon as an admin
-    approves or declines their deposit/withdrawal."""
-    tx_type_label = "Deposit" if tx["tx_type"] == "deposit" else "Withdrawal"
-
-    if tx["status"] == "approved":
-        body = "Your balance has been credited." if tx["tx_type"] == "deposit" else "Your withdrawal has been processed and sent."
-        text = (
-            f"✅ <b>{tx_type_label} Approved</b>\n\n"
-            f"Tx ID: #{tx['tx_id']}\n"
-            f"Amount: ${tx['amount']}\n\n"
-            f"{body}"
-        )
-    else:
-        body = (
-            "The reserved amount has been refunded to your wallet balance."
-            if tx["tx_type"] == "withdrawal"
-            else "If you believe this is a mistake, please contact support."
-        )
-        text = (
-            f"❌ <b>{tx_type_label} Declined</b>\n\n"
-            f"Tx ID: #{tx['tx_id']}\n"
-            f"Amount: ${tx['amount']}\n\n"
-            f"{body}"
-        )
-
+async def _notify_user(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str):
     try:
-        await bot.send_message(chat_id=tx["user_id"], text=text, parse_mode=ParseMode.HTML)
-    except (TelegramForbiddenError, TelegramBadRequest):
-        logger.exception("Failed to notify user %s of tx #%s result", tx["user_id"], tx["tx_id"])
+        await context.bot.send_message(user_id, text)
+    except Forbidden:
+        pass  # user has never started a DM with the bot
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
-# Wallet UI
+# Wallet display (DM)
 # ---------------------------------------------------------------------------
 
-def wallet_text(user_id: int) -> str:
+async def _send_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     with closing(get_conn()) as conn:
-        ensure_user(conn, user_id)
-        balance = get_balance(conn, user_id)
-        upi = get_user_upi(conn, user_id)
-
-    upi_line = f"💳 UPI: <code>{upi}</code>" if upi else "❌ UPI: Not saved yet"
-
-    return (
-        "🏦 <b>Your Wallet</b>\n\n"
-        f"💵 <b>Balance:</b> ${balance}\n"
-        f"{upi_line}\n\n"
-        f"<b>Min withdrawal: ${MIN_WITHDRAWAL}</b>"
-    )
-
-
-async def show_wallet(message_or_query):
-    user = message_or_query.from_user
-    if not user:
-        return
-
-    with closing(get_conn()) as conn:
-        ensure_user(conn, user.id, user.username, user.first_name)
-
-    text = wallet_text(user.id)
-    await _reply(message_or_query, text, parse_mode=ParseMode.HTML, reply_markup=wallet_keyboard())
-
-
-# ---------------------------------------------------------------------------
-# /start and /wallet
-# ---------------------------------------------------------------------------
-
-@router.message(CommandStart())
-async def start(message: Message, state: FSMContext):
-    await state.clear()
-    user = message.from_user
-
-    with closing(get_conn()) as conn:
-        ensure_user(conn, user.id, user.username, user.first_name)
-
-    if await is_blocked(message, user.id):
-        return
-
-    if message.chat.type == "private":
-        text = (
-            f"✨ <b>Welcome, {user.first_name}!</b>\n\n"
-            "🎮 <b>BlockVerse-BOT</b>\n\n"
-            "Use /wallet to open your wallet.\n"
-            "You can deposit, withdraw, view history, and read the usage guide."
-        )
-        kb = InlineKeyboardBuilder()
-        add_button(kb, text="Official Group", url=GROUP_LINK, style="primary")
-        kb.adjust(1)
-        await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb.as_markup())
-    else:
-        await message.answer(
-            "🎮 <b>Betting Bot is Active!</b>\n\n"
-            "Use <code>/bet &lt;@username|reply&gt; &lt;amount&gt;</code> to place a challenge.\n"
-            "Use <code>/wallet</code> in DM to manage your wallet.",
-            parse_mode=ParseMode.HTML,
-        )
-
-
-@router.message(Command("wallet"))
-async def wallet_command(message: Message, state: FSMContext):
-    await state.clear()
-
-    if message.chat.type != "private":
-        await message.answer("🏦 Please open the bot in private chat and use /wallet.")
-        return
-
-    if await is_blocked(message, message.from_user.id):
-        return
-
-    await show_wallet(message)
-
-
-# ---------------------------------------------------------------------------
-# Wallet callbacks: History / Usage / Back
-# ---------------------------------------------------------------------------
-
-@router.callback_query(F.data == "wallet:history")
-async def wallet_history_callback(call: CallbackQuery):
-    user = call.from_user
-
-    with closing(get_conn()) as conn:
-        ensure_user(conn, user.id, user.username, user.first_name)
-
-    if await is_blocked(call, user.id):
-        return
-
-    with closing(get_conn()) as conn:
-        bets = conn.execute(
-            """
-            SELECT bet_id, amount, emoji, prediction, status, winner_id, created_at
-            FROM bets
-            WHERE challenger_id=? OR opponent_id=?
-            ORDER BY bet_id DESC
-            LIMIT 30
-            """,
-            (user.id, user.id),
-        ).fetchall()
-
+        wallet = ensure_wallet(conn, user.id, user.username)
         txs = conn.execute(
-            """
-            SELECT tx_id, tx_type, method, amount, details, status, created_at
-            FROM transactions
-            WHERE user_id=?
-            ORDER BY tx_id DESC
-            LIMIT 30
-            """,
+            "SELECT * FROM transactions WHERE user_id=? ORDER BY tx_id DESC LIMIT 10",
+            (user.id,),
+        ).fetchall()
+        groups = conn.execute(
+            "SELECT chat_id, chat_title, chat_username FROM group_players WHERE user_id=?",
             (user.id,),
         ).fetchall()
 
-    lines = ["📜 <b>Full History</b>", ""]
-
-    if txs:
-        lines.append("<b>💳 Transactions</b>")
-        for tx in txs:
-            details = f" — {tx['details']}" if tx["details"] else ""
-            lines.append(
-                f"#{tx['tx_id']} • {tx['tx_type'].title()} "
-                f"${tx['amount']} • {tx['method'].upper()} "
-                f"• {tx['status'].title()}{details}"
-            )
-    else:
-        lines.append("<b>💳 Transactions</b>\nNo transactions yet.")
+    lines = ["💼 *Your Wallet*", f"Balance: {wallet['balance']} pts"]
+    if wallet["banned"]:
+        lines.append("⚠️ Your account is currently *banned* from playing.")
 
     lines.append("")
-
-    if bets:
-        lines.append("<b>🎮 Betting History</b>")
-        for bet in bets:
-            if bet["status"] == "resolved":
-                result = "WIN" if bet["winner_id"] == user.id else "LOSS"
-            else:
-                result = bet["status"].upper()
-            lines.append(
-                f"Bet #{bet['bet_id']} • ${bet['amount']} • "
-                f"{bet['emoji']} {bet['prediction'].upper()} • {result}"
-            )
+    lines.append("📜 *Recent activity*")
+    if txs:
+        for t in txs:
+            sign = "+" if t["amount"] >= 0 else ""
+            label = t["type"].replace("_", " ")
+            when = (t["created_at"] or "").split("T")[0]
+            lines.append(f"{sign}{t['amount']} pts — {label} ({when})")
     else:
-        lines.append("<b>🎮 Betting History</b>\nNo betting history yet.")
+        lines.append("No activity yet.")
 
-    await call.answer()
-    await call.message.edit_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-        reply_markup=back_to_wallet_keyboard(),
-    )
+    linkable = [g for g in groups if g["chat_username"]]
+    unlinkable = [g for g in groups if not g["chat_username"]]
 
+    if unlinkable:
+        lines.append("")
+        lines.append("Groups you play in (open them directly):")
+        for g in unlinkable:
+            lines.append(f"• {g['chat_title'] or 'Unnamed group'}")
 
-@router.callback_query(F.data == "wallet:usage")
-async def wallet_usage_callback(call: CallbackQuery):
-    await call.answer()
+    if not groups:
+        lines.append("")
+        lines.append("You haven't played in a group yet — get added to one to start!")
 
-    text = (
-        "📖 <b>How to Use BlockVerse-BOT</b>\n\n"
-        "<b>🏦 Wallet</b>\n"
-        "Use /wallet to check your balance and manage payments.\n\n"
-        "<b>📥 Deposit</b>\n"
-        "1. Tap Deposit.\n"
-        "2. Select UPI or USDT BEP-20.\n"
-        "3. Follow the payment instructions.\n"
-        "4. Enter the deposited dollar amount.\n"
-        "5. Wait for admin approval.\n\n"
-        "<b>📤 Withdrawal</b>\n"
-        f"Minimum withdrawal is ${MIN_WITHDRAWAL}.\n"
-        "Select UPI or USDT, enter the amount and destination.\n"
-        "Withdrawal funds are reserved until an admin approves or rejects it.\n\n"
-        "<b>🎮 Betting</b>\n"
-        "Betting is available in the official group only.\n"
-        "Use <code>/bet @username $amount</code> or reply to a user's message.\n"
-        "You can also complete the game selection using the buttons.\n\n"
-        "<b>🎯 Results</b>\n"
-        "The bot rolls the selected Telegram game emoji and determines "
-        "the result as even or odd.\n\n"
-        "<b>⚠️ Important</b>\n"
-        "Never send payment to an address other than the one displayed by "
-        "the bot. Keep your transaction details for verification."
-    )
+    keyboard = [
+        [InlineKeyboardButton(f"🎮 Play in {g['chat_title'] or g['chat_username']}",
+                               url=f"https://t.me/{g['chat_username']}")]
+        for g in linkable
+    ]
+    markup = InlineKeyboardMarkup(keyboard) if keyboard else None
 
-    await call.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=back_to_wallet_keyboard())
-
-
-@router.callback_query(F.data == "wallet:back")
-async def wallet_back_callback(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    await state.clear()
-    await show_wallet(call)
-
-
-# ---------------------------------------------------------------------------
-# Deposit / Withdrawal entry points
-# ---------------------------------------------------------------------------
-
-@router.callback_query(F.data == "wallet:deposit")
-async def wallet_deposit_entry(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    if await is_blocked(call, call.from_user.id):
-        return
-
-    await call.message.edit_text(
-        "📥 <b>Deposit</b>\n\nSelect your payment method:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=deposit_method_keyboard(),
-    )
-
-
-@router.callback_query(F.data == "wallet:withdraw")
-async def wallet_withdraw_entry(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    if await is_blocked(call, call.from_user.id):
-        return
-
-    await call.message.edit_text(
-        f"📤 <b>Withdrawal</b>\n\nMinimum withdrawal: ${MIN_WITHDRAWAL}\n\n"
-        "Select your withdrawal method:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=withdraw_method_keyboard(),
+    await update.effective_message.reply_text(
+        "\n".join(lines), parse_mode="Markdown", reply_markup=markup
     )
 
 
 # ---------------------------------------------------------------------------
-# Deposit flow
+# Basic commands
 # ---------------------------------------------------------------------------
 
-@router.callback_query(F.data.startswith("dep_method:"))
-async def process_dep_method(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    method = call.data.split(":", 1)[1]
-    await state.update_data(dep_method=method)
-
-    with closing(get_conn()) as conn:
-        if method == "upi":
-            address = get_config_val(conn, "upi_id")
-            instructions = f"💳 Send payment via UPI to:\n<code>{address}</code>"
-        else:
-            address = get_config_val(conn, "usdt_bep20_address")
-            instructions = f"🪙 Send BEP-20 USDT to:\n<code>{address}</code>"
-
-    await call.message.edit_text(
-        "📥 <b>Deposit Instructions</b>\n\n"
-        f"{instructions}\n\n"
-        "After completing the transfer, enter the total dollar amount "
-        "you deposited.\n\n"
-        "Example: <code>10</code>",
-        parse_mode=ParseMode.HTML,
-    )
-    await state.set_state(WalletStates.dep_amount)
-
-
-@router.message(WalletStates.dep_amount, ~F.text.in_(ADMIN_MENU_BUTTONS))
-async def process_deposit_amount(message: Message, state: FSMContext):
-    user = message.from_user
-
-    try:
-        raw = (message.text or "").strip().replace("$", "")
-        amount = int(raw)
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Enter a valid positive dollar amount.\nExample: 10")
-        return
-
-    data = await state.get_data()
-    method = data.get("dep_method", "unknown")
-
-    with closing(get_conn()) as conn:
-        ensure_user(conn, user.id, user.username, user.first_name)
-        cursor = conn.execute(
-            """
-            INSERT INTO transactions (user_id, tx_type, method, amount, status, created_at)
-            VALUES (?, 'deposit', ?, ?, 'pending', ?)
-            """,
-            (user.id, method, amount, datetime.utcnow().isoformat()),
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_private_chat(update):
+        with closing(get_conn()) as conn:
+            ensure_wallet(conn, update.effective_user.id, update.effective_user.username)
+        if context.args and context.args[0] == "wallet":
+            await _send_wallet(update, context)
+            return
+        await update.message.reply_text(
+            "Welcome! I run point-based betting games in group chats.\n"
+            "Add me to a group to challenge friends there. Use /balance here anytime "
+            "for your wallet and history."
         )
-        conn.commit()
-        tx_id = cursor.lastrowid
-
-    await state.clear()
-
-    await message.answer(
-        "✅ <b>Deposit request submitted.</b>\n\n"
-        "An admin must verify and approve the payment before the balance is credited.",
-        parse_mode=ParseMode.HTML,
-    )
-    await show_wallet(message)
-    await notify_admins_new_tx(tx_id, "deposit", user, method, amount)
-
-
-# ---------------------------------------------------------------------------
-# Withdrawal flow
-# ---------------------------------------------------------------------------
-
-@router.callback_query(F.data.startswith("with_method:"))
-async def process_with_method(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    method = call.data.split(":", 1)[1]
-    await state.update_data(with_method=method)
-
-    await call.message.edit_text(
-        f"📤 <b>Withdrawal — {method.upper()}</b>\n\n"
-        f"Minimum withdrawal: ${MIN_WITHDRAWAL}\n\n"
-        "Enter the dollar amount you wish to withdraw.\n"
-        "Example: <code>5</code>",
-        parse_mode=ParseMode.HTML,
-    )
-    await state.set_state(WalletStates.with_amount)
-
-
-@router.message(WalletStates.with_amount, ~F.text.in_(ADMIN_MENU_BUTTONS))
-async def process_with_amount(message: Message, state: FSMContext):
-    user = message.from_user
-
-    try:
-        raw = (message.text or "").strip().replace("$", "")
-        amount = int(raw)
-        if amount < MIN_WITHDRAWAL:
-            raise ValueError
-    except ValueError:
-        await message.answer(f"❌ Minimum withdrawal is ${MIN_WITHDRAWAL}.\nEnter a valid dollar amount.")
         return
 
+    chat = update.effective_chat
+    user = update.effective_user
     with closing(get_conn()) as conn:
-        ensure_user(conn, user.id, user.username, user.first_name)
-
-        if is_user_banned(conn, user.id):
-            await message.answer("🚫 You are banned from using this bot.")
-            await state.clear()
-            return
-
-        balance = get_balance(conn, user.id)
-        if balance < amount:
-            await message.answer(f"❌ Insufficient funds.\nCurrent balance: ${balance}")
-            await state.clear()
-            return
-
-    await state.update_data(with_amount=amount)
-    data = await state.get_data()
-    method = data.get("with_method")
-
-    prompt = (
-        "💳 Enter your UPI ID.\n\nYour UPI ID will be saved for future withdrawals."
-        if method == "upi"
-        else "🪙 Enter your USDT BEP-20 wallet address."
+        ensure_wallet(conn, user.id, user.username)
+        register_group_player(conn, chat.id, chat.title, chat.username, user.id, user.username)
+    await update.message.reply_text(
+        "Welcome! Everyone starts with 1000 points.\n"
+        "Use /help to see how to challenge other players."
     )
 
-    await message.answer(prompt)
-    await state.set_state(WalletStates.with_address)
 
-
-@router.message(WalletStates.with_address, ~F.text.in_(ADMIN_MENU_BUTTONS))
-async def process_with_address(message: Message, state: FSMContext):
-    user = message.from_user
-    address = (message.text or "").strip()
-
-    data = await state.get_data()
-    amount = data.get("with_amount")
-    method = data.get("with_method")
-
-    if not address or amount is None or method is None:
-        await message.answer("❌ Withdrawal session expired. Please use /wallet again.")
-        await state.clear()
-        return
-
-    if method == "upi" and (" " in address or len(address) < 3):
-        await message.answer("❌ Please enter a valid UPI ID.")
-        return
-
-    if method == "usdt_bep20" and len(address) < 20:
-        await message.answer("❌ Please enter a valid BEP-20 wallet address.")
-        return
-
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with closing(get_conn()) as conn:
-        ensure_user(conn, user.id, user.username, user.first_name)
-        balance = get_balance(conn, user.id)
+        admin = is_admin(conn, update.effective_user.id)
 
-        if balance < amount:
-            await message.answer("❌ Insufficient balance. Your balance changed during processing.")
-            await state.clear()
-            return
-
-        # Reserve funds immediately.
-        adjust_balance(conn, user.id, -amount)
-
-        if method == "upi":
-            save_user_upi(conn, user.id, address)
-
-        cursor = conn.execute(
-            """
-            INSERT INTO transactions (user_id, tx_type, method, amount, details, status, created_at)
-            VALUES (?, 'withdrawal', ?, ?, ?, 'pending', ?)
-            """,
-            (user.id, method, amount, address, datetime.utcnow().isoformat()),
+    if is_private_chat(update):
+        text = (
+            "*Wallet (DM only)*\n"
+            "/balance - your balance, deposit/withdrawal history, and quick links "
+            "back into your groups\n\n"
+            "Betting itself happens in group chats — add me to a group and use /bet there."
         )
-        conn.commit()
-        tx_id = cursor.lastrowid
-
-    await state.clear()
-
-    await message.answer(
-        f"✅ <b>Withdrawal request submitted.</b>\n\n"
-        f"Amount: ${amount}\n"
-        f"Method: {method.upper()}\n"
-        "Your funds are reserved until an admin approves or rejects the request.",
-        parse_mode=ParseMode.HTML,
-    )
-    await show_wallet(message)
-    await notify_admins_new_tx(tx_id, "withdrawal", user, method, amount, details=address)
-
-
-# ---------------------------------------------------------------------------
-# Group Betting
-# ---------------------------------------------------------------------------
-
-async def _create_bet_and_announce(chat_id: int, challenger, challenge_data: dict, amount: int, emoji: str, prediction: str):
-    with closing(get_conn()) as conn:
-        ensure_user(conn, challenger.id, challenger.username, challenger.first_name)
-
-        if get_balance(conn, challenger.id) < amount:
-            await bot.send_message(chat_id, f"❌ {challenger.first_name} has insufficient balance.")
-            return
-
-        cursor = conn.execute(
-            """
-            INSERT INTO bets
-            (chat_id, challenger_id, challenger_name, opponent_id, opponent_name,
-             amount, emoji, prediction, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-            """,
-            (
-                chat_id,
-                challenger.id,
-                challenger.username or challenger.first_name,
-                challenge_data.get("opponent_id"),
-                challenge_data.get("opponent_username"),
-                amount,
-                emoji,
-                prediction,
-                datetime.utcnow().isoformat(),
-            ),
+    else:
+        text = (
+            "*Commands*\n"
+            "/bet @user - or reply to someone's message with /bet - start a challenge\n"
+            "  _Fast path: /bet @alice 100 🎲 even_\n"
+            "/accept - reply to the bot's challenge message with /accept\n"
+            "/accept <bet_id> - or accept by id directly\n"
+            "/cancel <bet_id> - cancel your unaccepted bet\n"
+            "/mybets - list your open/pending bets\n"
+            "/leaderboard - top balances in this chat\n\n"
+            "DM me /balance to see your wallet & history.\n\n"
+            "Supported games: 🎲 Dice, 🎯 Darts, 🎳 Bowling, 🏀 Basketball, ⚽ Football, 🎰 Slots"
         )
-        conn.commit()
-        bet_id = cursor.lastrowid
 
-    text = (
-        f"🎲 <b>Bet #{bet_id} Active!</b>\n\n"
-        f"👤 <b>Challenger:</b> {challenger.first_name}\n"
-        f"🎯 <b>Target:</b> {challenge_data.get('opponent_display')}\n"
-        f"💵 <b>Stake:</b> ${amount}\n"
-        f"🎮 <b>Game:</b> {emoji}\n"
-        f"🎯 <b>Prediction:</b> {prediction.upper()}\n\n"
-        f"To accept, the target opponent can reply to this message "
-        f"or use <code>/accept {bet_id}</code>."
-    )
-
-    sent = await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
-
-    with closing(get_conn()) as conn:
-        conn.execute(
-            "UPDATE bets SET challenge_message_id=? WHERE bet_id=?",
-            (sent.message_id, bet_id),
+    if admin:
+        text += (
+            "\n\n*Admin panel*\n"
+            "/ban <@user|id> - ban a player\n"
+            "/unban <@user|id> - unban a player\n"
+            "/deposit <@user|id> <amount> - credit a wallet\n"
+            "/withdraw <@user|id> <amount> - debit a wallet\n"
+            "/settax <percent> - set house tax on payouts (0-100)\n"
+            "/tax - show current tax rate\n"
+            "/housebalance - total tax collected\n"
+            "/stats - full economy overview (players, volume, tax, etc.)\n"
+            "/addadmin <user_id> - grant admin rights"
         )
-        conn.commit()
+
+    await update.effective_message.reply_text(text, parse_mode="Markdown")
 
 
-@router.message(Command("bet"))
-async def bet_start(message: Message, command: CommandObject, state: FSMContext):
-    if message.chat.type == "private":
-        await message.answer("⚠️ Betting features are available only inside the official group.")
+async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        bot_username = context.bot.username
+        markup = None
+        if bot_username:
+            markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton(
+                    "💬 Check wallet in DM",
+                    url=f"https://t.me/{bot_username}?start=wallet",
+                )]]
+            )
+        await update.message.reply_text(
+            "Your wallet and transaction history are private — check them in our DM.",
+            reply_markup=markup,
+        )
         return
+    await _send_wallet(update, context)
 
-    challenger = message.from_user
-    chat_id = message.chat.id
+
+# ---------------------------------------------------------------------------
+# /bet conversation flow (group only)
+# ---------------------------------------------------------------------------
+
+async def bet_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update, context):
+        return ConversationHandler.END
+
+    chat = update.effective_chat
+    chat_id = chat.id
+    challenger = update.effective_user
 
     with closing(get_conn()) as conn:
-        ensure_user(conn, challenger.id, challenger.username, challenger.first_name)
-        if is_user_banned(conn, challenger.id):
-            await message.answer("🚫 You are banned from participating in games.")
-            return
+        ensure_wallet(conn, challenger.id, challenger.username)
+        register_group_player(conn, chat_id, chat.title, chat.username, challenger.id, challenger.username)
+        if is_banned(conn, challenger.id):
+            await update.message.reply_text("⛔ You are banned from playing.")
+            return ConversationHandler.END
 
-    args = (command.args or "").split() if command.args else []
+    args = context.args or []
     opponent_id = None
     opponent_username = None
     opponent_display = None
@@ -1094,786 +499,638 @@ async def bet_start(message: Message, command: CommandObject, state: FSMContext)
 
     if args and args[0].startswith("@"):
         opponent_username = args[0].lstrip("@")
-
         with closing(get_conn()) as conn:
-            opponent_id = find_user_id_by_username(conn, opponent_username)
-
-        if opponent_id is None:
-            await message.answer("❌ I could not find that user in the database. Ask them to use /start first.")
-            return
-
+            opponent_id = resolve_user_ref(conn, args[0])
         opponent_display = f"@{opponent_username}"
         remaining_args = args[1:]
-
-    elif message.reply_to_message and message.reply_to_message.from_user:
-        replied = message.reply_to_message.from_user
-
-        if replied.is_bot or replied.id == challenger.id:
-            await message.answer("❌ Invalid opponent target.")
-            return
-
+    elif update.message.reply_to_message and update.message.reply_to_message.from_user:
+        replied = update.message.reply_to_message.from_user
+        if replied.is_bot:
+            await update.message.reply_text("You can't challenge a bot.")
+            return ConversationHandler.END
+        if replied.id == challenger.id:
+            await update.message.reply_text("You can't challenge yourself.")
+            return ConversationHandler.END
         opponent_id = replied.id
         opponent_username = replied.username
         opponent_display = f"@{replied.username}" if replied.username else replied.first_name
-
         with closing(get_conn()) as conn:
-            ensure_user(conn, replied.id, replied.username, replied.first_name)
-
+            ensure_wallet(conn, replied.id, replied.username)
+            register_group_player(conn, chat_id, chat.title, chat.username, replied.id, replied.username)
         remaining_args = args
-
     else:
-        await message.answer(
-            "Specify an opponent by tagging them:\n"
-            "<code>/bet @username 2</code>\n\n"
-            "Or reply to their message:\n"
-            "<code>/bet 2</code>",
-            parse_mode=ParseMode.HTML,
+        await update.message.reply_text(
+            "Tell me who to challenge:\n"
+            "• /bet @username\n"
+            "• or reply to their message with /bet"
         )
-        return
+        return ConversationHandler.END
 
-    challenge_data = {
+    if opponent_id is not None:
+        with closing(get_conn()) as conn:
+            if is_banned(conn, opponent_id):
+                await update.message.reply_text("⛔ That player is banned from playing.")
+                return ConversationHandler.END
+
+    context.user_data["bet_challenge"] = {
         "opponent_id": opponent_id,
         "opponent_username": opponent_username,
         "opponent_display": opponent_display,
         "challenger_id": challenger.id,
     }
 
+    # Fast path for power users: /bet @user 100 🎲 even
     if len(remaining_args) >= 2:
+        amount = None
         try:
-            amount = int(remaining_args[0].replace("$", ""))
-
-            if amount > 0:
-                emoji = "🎲"
-                prediction = None
-
-                for arg in remaining_args[1:]:
-                    if arg in VALID_EMOJIS:
-                        emoji = arg
-                    elif arg.lower() in ("even", "odd"):
-                        prediction = arg.lower()
-
-                if prediction:
-                    with closing(get_conn()) as conn:
-                        bal = get_balance(conn, challenger.id)
-                    if bal < amount:
-                        await message.answer(f"❌ Insufficient balance. Available: ${bal}")
-                        return
-
-                    await _create_bet_and_announce(chat_id, challenger, challenge_data, amount, emoji, prediction)
-                    return
+            candidate = int(remaining_args[0])
+            if candidate > 0:
+                amount = candidate
         except ValueError:
-            pass
+            amount = None
 
-    await state.update_data(bet_challenge=challenge_data)
-    await message.answer("💵 Enter the dollar amount for this bet:", reply_markup=ForceReply(selective=True))
-    await state.set_state(BetStates.ask_amount)
+        if amount is not None:
+            emoji = "🎲"
+            prediction = None
+            for a in remaining_args[1:]:
+                if a in VALID_EMOJIS:
+                    emoji = a
+                elif a.lower() in ("even", "odd"):
+                    prediction = a.lower()
+            if prediction:
+                await _create_bet_and_announce(update, context, amount, emoji, prediction)
+                context.user_data.pop("bet_challenge", None)
+                return ConversationHandler.END
+
+    await update.message.reply_text(
+        f"Challenging {opponent_display}! How many points do you want to bet?\n"
+        f"(reply to this message with a number)",
+        reply_markup=ForceReply(selective=True),
+    )
+    return ASK_AMOUNT
 
 
-@router.message(BetStates.ask_amount, ~F.text.in_(ADMIN_MENU_BUTTONS))
-async def ask_amount(message: Message, state: FSMContext):
+async def ask_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
     try:
-        amount = int((message.text or "").strip().replace("$", ""))
+        amount = int(text)
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Enter a positive dollar amount.", reply_markup=ForceReply(selective=True))
-        return
-
-    challenger = message.from_user
-
-    with closing(get_conn()) as conn:
-        balance = get_balance(conn, challenger.id)
-
-    if balance < amount:
-        await message.answer(
-            f"❌ Insufficient funds.\nAvailable balance: ${balance}",
+        await update.message.reply_text(
+            "Please send a positive whole number of points.",
             reply_markup=ForceReply(selective=True),
         )
-        return
+        return ASK_AMOUNT
 
-    data = await state.get_data()
-    challenge_data = data.get("bet_challenge", {})
-    challenge_data["amount"] = amount
-    await state.update_data(bet_challenge=challenge_data)
+    challenger = update.effective_user
+    with closing(get_conn()) as conn:
+        wallet = ensure_wallet(conn, challenger.id, challenger.username)
 
-    await message.answer(
-        "🎮 <b>Select game mode:</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=game_select_keyboard(),
+    if wallet["balance"] < amount:
+        await update.message.reply_text(
+            f"You only have {wallet['balance']} points — pick a smaller amount.",
+            reply_markup=ForceReply(selective=True),
+        )
+        return ASK_AMOUNT
+
+    context.user_data["bet_challenge"]["amount"] = amount
+
+    keyboard = [
+        [InlineKeyboardButton(f"{emoji} {label}", callback_data=f"game:{emoji}")]
+        for emoji, label in GAME_EMOJI_LABELS.items()
+    ]
+    await update.message.reply_text("Pick a game:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return ASK_GAME
+
+
+async def ask_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    emoji = query.data.split(":", 1)[1]
+    context.user_data.setdefault("bet_challenge", {})["emoji"] = emoji
+
+    keyboard = [[
+        InlineKeyboardButton("🟢 Even", callback_data="pred:even"),
+        InlineKeyboardButton("🔴 Odd", callback_data="pred:odd"),
+    ]]
+    await query.edit_message_text(
+        f"Game: {emoji} {GAME_EMOJI_LABELS.get(emoji, '')}\nNow pick your prediction:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
-    await state.set_state(BetStates.ask_game)
+    return ASK_PREDICTION
 
 
-@router.callback_query(BetStates.ask_game, F.data.startswith("game:"))
-async def ask_game(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    emoji = call.data.split(":", 1)[1]
-
-    data = await state.get_data()
-    challenge_data = data.get("bet_challenge", {})
-    challenge_data["emoji"] = emoji
-    await state.update_data(bet_challenge=challenge_data)
-
-    await call.message.edit_text(
-        f"Selected Game: {emoji}\n\nChoose your outcome prediction:",
-        reply_markup=prediction_keyboard(),
-    )
-    await state.set_state(BetStates.ask_prediction)
-
-
-@router.callback_query(BetStates.ask_prediction, F.data.startswith("pred:"))
-async def ask_prediction(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    prediction = call.data.split(":", 1)[1]
-
-    data = await state.get_data()
-    challenge_data = data.get("bet_challenge", {})
-    amount = challenge_data.get("amount")
-    emoji = challenge_data.get("emoji")
+async def ask_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    prediction = query.data.split(":", 1)[1]
+    data = context.user_data.get("bet_challenge", {})
+    amount = data.get("amount")
+    emoji = data.get("emoji")
 
     if amount is None or emoji is None:
-        await call.message.edit_text("❌ Bet setup expired. Please start again.")
-        await state.clear()
-        return
+        await query.edit_message_text("Something went wrong — please start again with /bet.")
+        context.user_data.pop("bet_challenge", None)
+        return ConversationHandler.END
 
-    await call.message.edit_text("🎮 Initializing bet challenge...")
+    await query.edit_message_text("Creating bet...")
+    await _create_bet_and_announce(update, context, amount, emoji, prediction, via_callback=True)
+    context.user_data.pop("bet_challenge", None)
+    return ConversationHandler.END
 
-    await _create_bet_and_announce(call.message.chat.id, call.from_user, challenge_data, amount, emoji, prediction)
-    await state.clear()
+
+async def bet_cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("bet_challenge", None)
+    await update.message.reply_text("Bet creation cancelled.")
+    return ConversationHandler.END
 
 
-@router.message(Command("accept"))
-async def accept_cmd(message: Message, command: CommandObject):
-    if message.chat.type == "private":
-        await message.answer("⚠️ Bet acceptance must occur inside the official group.")
-        return
+async def _create_bet_and_announce(update, context, amount, emoji, prediction, via_callback=False):
+    chat_id = update.effective_chat.id
+    challenger = update.effective_user
+    data = context.user_data.get("bet_challenge", {})
+    opponent_id = data.get("opponent_id")
+    opponent_username = data.get("opponent_username")
+    opponent_display = data.get("opponent_display") or "opponent"
 
-    chat_id = message.chat.id
-    user = message.from_user
-    bet_id = None
-
-    if command.args:
-        try:
-            bet_id = int(command.args.strip().split()[0])
-        except (ValueError, IndexError):
-            await message.answer("❌ Invalid bet ID.")
+    with closing(get_conn()) as conn:
+        wallet = ensure_wallet(conn, challenger.id, challenger.username)
+        if wallet["balance"] < amount:
+            msg = f"You only have {wallet['balance']} points - can't bet {amount}."
+            if via_callback:
+                await context.bot.send_message(chat_id, msg)
+            else:
+                await update.message.reply_text(msg)
             return
 
-    elif message.reply_to_message:
-        with closing(get_conn()) as conn:
-            row = conn.execute(
-                """
-                SELECT bet_id FROM bets
-                WHERE chat_id=? AND challenge_message_id=? AND status='pending'
-                """,
-                (chat_id, message.reply_to_message.message_id),
-            ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO bets (chat_id, challenger_id, challenger_name, opponent_id,
+                               opponent_name, amount, emoji, prediction, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                chat_id,
+                challenger.id,
+                challenger.username or challenger.first_name,
+                opponent_id,
+                opponent_username,
+                amount,
+                emoji,
+                prediction,
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        conn.commit()
+        bet_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+
+    opposite_prediction = "odd" if prediction == "even" else "even"
+    challenger_tag = f"@{challenger.username}" if challenger.username else challenger.first_name
+    text = (
+        f"🎲 Bet #{bet_id} created!\n"
+        f"{challenger_tag} challenges {opponent_display} for {amount} points.\n"
+        f"Game: {emoji}\n"
+        f"Prediction: {challenger_tag} picked *{prediction.upper()}* "
+        f"(giving {opponent_display} *{opposite_prediction.upper()}*)\n\n"
+        f"{opponent_display}, reply to THIS message with /accept to start!"
+    )
+    sent = await context.bot.send_message(chat_id, text, parse_mode="Markdown")
+
+    with closing(get_conn()) as conn:
+        conn.execute(
+            "UPDATE bets SET challenge_message_id=? WHERE bet_id=?", (sent.message_id, bet_id)
+        )
+        conn.commit()
+
+
+bet_conv = ConversationHandler(
+    entry_points=[CommandHandler("bet", bet_start)],
+    states={
+        ASK_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_amount)],
+        ASK_GAME: [CallbackQueryHandler(ask_game, pattern="^game:")],
+        ASK_PREDICTION: [CallbackQueryHandler(ask_prediction, pattern="^pred:")],
+    },
+    fallbacks=[CommandHandler("cancel", bet_cancel_conv)],
+    name="bet_conversation",
+    persistent=False,
+)
+
+
+# ---------------------------------------------------------------------------
+# /accept, /cancel, /mybets, /leaderboard (group only)
+# ---------------------------------------------------------------------------
+
+async def accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update, context):
+        return
+
+    chat = update.effective_chat
+    chat_id = chat.id
+    user = update.effective_user
+
+    bet_id = None
+    if context.args:
+        try:
+            bet_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("bet_id must be a number.")
+            return
+    elif update.message.reply_to_message and update.message.reply_to_message.from_user:
+        replied = update.message.reply_to_message
+        if replied.from_user.id == context.bot.id:
+            with closing(get_conn()) as conn:
+                row = conn.execute(
+                    """
+                    SELECT bet_id FROM bets
+                    WHERE chat_id=? AND challenge_message_id=? AND status='pending'
+                    """,
+                    (chat_id, replied.message_id),
+                ).fetchone()
             if row:
                 bet_id = row["bet_id"]
 
-    if not bet_id:
-        await message.answer(
-            "Reply to a bet challenge or use <code>/accept &lt;bet_id&gt;</code>.",
-            parse_mode=ParseMode.HTML,
+    if bet_id is None:
+        await update.message.reply_text(
+            "Reply to the bet challenge message with /accept, or use /accept <bet_id>."
         )
         return
 
     with closing(get_conn()) as conn:
-        ensure_user(conn, user.id, user.username, user.first_name)
+        ensure_wallet(conn, user.id, user.username)
+        register_group_player(conn, chat_id, chat.title, chat.username, user.id, user.username)
 
-        if is_user_banned(conn, user.id):
-            await message.answer("🚫 You are banned from participating.")
+        if is_banned(conn, user.id):
+            await update.message.reply_text("⛔ You are banned from playing.")
             return
 
-        bet = conn.execute("SELECT * FROM bets WHERE bet_id=? AND chat_id=?", (bet_id, chat_id)).fetchone()
+        bet = conn.execute(
+            "SELECT * FROM bets WHERE bet_id=? AND chat_id=?", (bet_id, chat_id)
+        ).fetchone()
 
-        if not bet or bet["status"] != "pending":
-            await message.answer("❌ This challenge is no longer available.")
+        if bet is None:
+            await update.message.reply_text("No bet with that ID here.")
             return
-
-        if bet["opponent_id"] and bet["opponent_id"] != user.id:
-            await message.answer("❌ You are not the designated opponent for this bet.")
+        if bet["status"] != "pending":
+            await update.message.reply_text(f"Bet #{bet_id} is already '{bet['status']}'.")
             return
-
         if bet["challenger_id"] == user.id:
-            await message.answer("❌ You cannot accept your own challenge.")
+            await update.message.reply_text("You can't accept your own bet.")
             return
 
-        challenger_bal = get_balance(conn, bet["challenger_id"])
-        opponent_bal = get_balance(conn, user.id)
-
-        if challenger_bal < bet["amount"] or opponent_bal < bet["amount"]:
-            await message.answer("❌ One or both players do not have enough balance.")
+        expected_tag = (bet["opponent_name"] or "").lstrip("@").lower()
+        if expected_tag and (user.username or "").lower() != expected_tag:
+            await update.message.reply_text(f"This bet was aimed at @{expected_tag}, not you.")
             return
 
-        tax_percent = int(get_config_val(conn, "tax_percent") or "0")
+        wallet = get_wallet(conn, user.id)
+        if wallet["balance"] < bet["amount"]:
+            await update.message.reply_text(
+                f"You need {bet['amount']} points to accept, you have {wallet['balance']}."
+            )
+            return
 
         conn.execute(
-            "UPDATE bets SET status='accepted', opponent_id=?, opponent_name=? WHERE bet_id=?",
-            (user.id, user.username or user.first_name, bet_id),
+            "UPDATE bets SET status='accepted', opponent_id=? WHERE bet_id=?", (user.id, bet_id)
         )
         conn.commit()
 
-    dice_msg = await bot.send_dice(chat_id=chat_id, emoji=bet["emoji"])
+    await update.message.reply_text(f"✅ Bet #{bet_id} accepted! Rolling {bet['emoji']}...")
 
+    dice_msg = await context.bot.send_dice(chat_id=chat_id, emoji=bet["emoji"])
     rolled_value = dice_msg.dice.value
     outcome = "even" if rolled_value % 2 == 0 else "odd"
 
-    winner_id = bet["challenger_id"] if outcome == bet["prediction"] else user.id
-    loser_id = user.id if winner_id == bet["challenger_id"] else bet["challenger_id"]
+    if outcome == bet["prediction"]:
+        winner_id, loser_id = bet["challenger_id"], user.id
+        winner_name = bet["challenger_name"]
+    else:
+        winner_id, loser_id = user.id, bet["challenger_id"]
+        winner_name = user.username or user.first_name
 
-    raw_amount = int(bet["amount"])
-    tax_amount = int(raw_amount * tax_percent / 100)
-    payout = raw_amount - tax_amount
-
-    with closing(get_conn()) as conn:
-        adjust_balance(conn, loser_id, -raw_amount)
-        adjust_balance(conn, winner_id, payout)
-        conn.execute("UPDATE bets SET status='resolved', winner_id=? WHERE bet_id=?", (winner_id, bet_id))
-        conn.commit()
-
-    await message.answer(
-        f"🎯 <b>Outcome:</b> {rolled_value} ({outcome.upper()})\n\n"
-        f"🏆 Winner: <a href='tg://user?id={winner_id}'>Player</a>\n"
-        f"💵 Payout: ${payout}\n"
-        f"📊 Platform tax: {tax_percent}%",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Admin Panel
-# ---------------------------------------------------------------------------
-
-def admin_only(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-@router.message(Command("admin"))
-async def admin_panel(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id):
-        await message.answer("Unauthorized access.")
-        return
-
-    await state.clear()
-    await message.answer(
-        "🔧 <b>Admin Operations Console</b>\n\nUse the buttons below to manage the bot.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=get_admin_menu_keyboard(),
-    )
-
-
-@router.message(F.text == "🏠 Main Menu")
-async def admin_main_menu(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id):
-        return
-    await state.clear()
-    await message.answer("🏠 Back to normal mode.", reply_markup=ReplyKeyboardRemove())
-
-
-@router.message(F.text.in_({"🟢 Bot Status: ON", "🔴 Bot Status: OFF"}))
-async def admin_toggle_bot_status(message: Message):
-    global BOT_STATUS
-    if not admin_only(message.from_user.id):
-        return
-    BOT_STATUS = not BOT_STATUS
-    await message.answer(
-        f"Bot status is now: {'🟢 ON' if BOT_STATUS else '🔴 OFF'}",
-        reply_markup=get_admin_menu_keyboard(),
-    )
-
-
-@router.message(F.text == "⚙️ Set Tax Rate")
-async def admin_ask_tax(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id):
-        return
-    await message.answer(
-        "Provide new global platform tax percentage (0 to 100):",
-        reply_markup=ForceReply(selective=True),
-    )
-    await state.set_state(AdminStates.set_tax)
-
-
-@router.message(AdminStates.set_tax)
-async def process_tax_set(message: Message, state: FSMContext):
-    try:
-        val = int((message.text or "").strip())
-        if not 0 <= val <= 100:
-            raise ValueError
-    except ValueError:
-        await message.answer("Please enter a percentage between 0 and 100.")
-        return
+    amount = bet["amount"]
 
     with closing(get_conn()) as conn:
-        set_config_val(conn, "tax_percent", str(val))
-        conn.commit()
+        tax_percent = get_tax_percent(conn)
+        # round-half-up so a 1-point bet at low tax % doesn't always truncate to 0,
+        # and totals reconcile correctly against amount * tax_percent / 100 on average
+        tax_amount = int((amount * tax_percent / 100) + 0.5)
+        tax_amount = min(tax_amount, amount)  # tax can never exceed the wagered amount
+        winner_gain = amount - tax_amount
 
-    await state.clear()
-    await message.answer(f"Global tax rate adjusted to {val}%.", reply_markup=get_admin_menu_keyboard())
-
-
-@router.message(F.text == "🚫 Ban User")
-async def admin_ask_ban(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id):
-        return
-    await message.answer("Provide target Telegram User ID to ban:", reply_markup=ForceReply(selective=True))
-    await state.set_state(AdminStates.ban_user)
-
-
-@router.message(F.text == "✅ Unban User")
-async def admin_ask_unban(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id):
-        return
-    await message.answer("Provide target Telegram User ID to unban:", reply_markup=ForceReply(selective=True))
-    await state.set_state(AdminStates.unban_user)
-
-
-async def _set_ban_state(message: Message, state: FSMContext, banned: int):
-    try:
-        uid = int((message.text or "").strip())
-    except ValueError:
-        await message.answer("Please enter a numeric Telegram User ID.")
-        return
-
-    with closing(get_conn()) as conn:
-        row = conn.execute("SELECT is_banned FROM users WHERE user_id=?", (uid,)).fetchone()
-        if not row:
-            await message.answer("Target User ID is not in the database.", reply_markup=get_admin_menu_keyboard())
-            await state.clear()
-            return
+        adjust_wallet(conn, winner_id, winner_gain, "bet_win", note=f"Bet #{bet_id}")
+        adjust_wallet(conn, loser_id, -amount, "bet_loss", note=f"Bet #{bet_id}")
+        if tax_amount > 0:
+            # The ledger (transactions table) is the single source of truth for tax
+            # collected — stats are computed by summing it directly, so there's
+            # nothing here that can drift out of sync.
+            _log_tx(conn, HOUSE_ACCOUNT_ID, "tax", tax_amount, note=f"Bet #{bet_id}")
 
         conn.execute(
-            "UPDATE users SET is_banned=?, updated_at=? WHERE user_id=?",
-            (banned, datetime.utcnow().isoformat(), uid),
+            "UPDATE bets SET status='resolved', winner_id=?, tax_amount=? WHERE bet_id=?",
+            (winner_id, tax_amount, bet_id),
         )
         conn.commit()
 
-    await state.clear()
-    status = "BANNED" if banned else "UNBANNED"
-    await message.answer(f"User ID {uid} has been set to: {status}.", reply_markup=get_admin_menu_keyboard())
-
-
-@router.message(AdminStates.ban_user)
-async def process_ban_user(message: Message, state: FSMContext):
-    await _set_ban_state(message, state, 1)
-
-
-@router.message(AdminStates.unban_user)
-async def process_unban_user(message: Message, state: FSMContext):
-    await _set_ban_state(message, state, 0)
-
-
-@router.message(F.text == "💳 Payment Gateways")
-async def admin_gateways(message: Message):
-    if not admin_only(message.from_user.id):
-        return
-    await message.answer("Select payment gateway configuration:", reply_markup=gateway_keyboard())
-
-
-@router.callback_query(F.data == "gateway:upi")
-async def admin_set_upi_prompt(call: CallbackQuery, state: FSMContext):
-    if not admin_only(call.from_user.id):
-        await call.answer("Unauthorized.", show_alert=True)
-        return
-    await call.answer()
-    await call.message.answer("Enter new default platform UPI ID:", reply_markup=ForceReply(selective=True))
-    await state.set_state(AdminStates.set_upi)
-
-
-@router.callback_query(F.data == "gateway:usdt")
-async def admin_set_usdt_prompt(call: CallbackQuery, state: FSMContext):
-    if not admin_only(call.from_user.id):
-        await call.answer("Unauthorized.", show_alert=True)
-        return
-    await call.answer()
-    await call.message.answer(
-        "Enter new default platform USDT BEP-20 receiving address:",
-        reply_markup=ForceReply(selective=True),
+    result_text = (
+        f"🎯 Result: Rolled a *{rolled_value}* ({outcome.upper()})!\n"
+        f"🏆 @{winner_name} wins Bet #{bet_id} and receives {winner_gain} points!"
     )
-    await state.set_state(AdminStates.set_usdt)
+    if tax_amount > 0:
+        result_text += f"\n🏛 House tax: {tax_amount} pts ({tax_percent:g}%)"
+    await update.message.reply_text(result_text, parse_mode="Markdown")
 
 
-@router.message(AdminStates.set_upi)
-async def process_upi_set(message: Message, state: FSMContext):
-    val = (message.text or "").strip()
-    if not val:
-        await message.answer("UPI ID cannot be empty.")
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update, context):
+        return
+
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    if not context.args:
+        await update.message.reply_text("Usage: /cancel <bet_id>")
+        return
+    try:
+        bet_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("bet_id must be a number.")
         return
 
     with closing(get_conn()) as conn:
-        set_config_val(conn, "upi_id", val)
+        bet = conn.execute(
+            "SELECT * FROM bets WHERE bet_id=? AND chat_id=?", (bet_id, chat_id)
+        ).fetchone()
+        if bet is None:
+            await update.message.reply_text("No bet with that ID here.")
+            return
+        if bet["challenger_id"] != user.id:
+            await update.message.reply_text("Only the challenger can cancel this bet.")
+            return
+        if bet["status"] != "pending":
+            await update.message.reply_text("Only a pending (not yet accepted) bet can be cancelled.")
+            return
+        conn.execute("UPDATE bets SET status='cancelled' WHERE bet_id=?", (bet_id,))
         conn.commit()
 
-    await state.clear()
-    await message.answer(
-        f"System UPI address updated to: <code>{val}</code>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=get_admin_menu_keyboard(),
-    )
+    await update.message.reply_text(f"Bet #{bet_id} cancelled.")
 
 
-@router.message(AdminStates.set_usdt)
-async def process_usdt_set(message: Message, state: FSMContext):
-    val = (message.text or "").strip()
-    if not val:
-        await message.answer("USDT address cannot be empty.")
+async def mybets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update, context):
         return
 
-    with closing(get_conn()) as conn:
-        set_config_val(conn, "usdt_bep20_address", val)
-        conn.commit()
-
-    await state.clear()
-    await message.answer(
-        f"System USDT BEP-20 address updated to: <code>{val}</code>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=get_admin_menu_keyboard(),
-    )
-
-
-@router.message(F.text == "📑 Pending Transactions")
-async def admin_pending_txs(message: Message):
-    if not admin_only(message.from_user.id):
-        return
+    chat_id = update.effective_chat.id
+    user = update.effective_user
 
     with closing(get_conn()) as conn:
-        txs = conn.execute(
-            "SELECT * FROM transactions WHERE status='pending' ORDER BY tx_id ASC LIMIT 20"
+        rows = conn.execute(
+            """
+            SELECT * FROM bets
+            WHERE chat_id=? AND status IN ('pending','accepted')
+              AND (challenger_id=? OR opponent_id=?)
+            ORDER BY bet_id DESC
+            """,
+            (chat_id, user.id, user.id),
         ).fetchall()
 
-    if not txs:
-        await message.answer("✅ The transaction approval queue is clean.")
+    if not rows:
+        await update.message.reply_text("You have no open bets.")
         return
 
-    for tx in txs:
-        detail_info = f"\nDetails: {tx['details']}" if tx["details"] else ""
-        await message.answer(
-            f"Tx ID #{tx['tx_id']}\n"
-            f"User: {tx['user_id']}\n"
-            f"Type: {tx['tx_type'].upper()}\n"
-            f"Method: {tx['method'].upper()}\n"
-            f"Amount: ${tx['amount']}"
-            f"{detail_info}",
-            reply_markup=tx_approval_keyboard(tx["tx_id"]),
-        )
+    lines = [
+        f"#{r['bet_id']} [{r['status']}] {r['challenger_name']} vs "
+        f"{r['opponent_name']} - {r['amount']} pts ({r['emoji']} {r['prediction']})"
+        for r in rows
+    ]
+    await update.message.reply_text("\n".join(lines))
 
 
-@router.callback_query(F.data.startswith("tx:"))
-async def handle_tx_approval(call: CallbackQuery):
-    if not admin_only(call.from_user.id):
-        await call.answer("Unauthorized.", show_alert=True)
+async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update, context):
         return
 
-    await call.answer()
-
-    try:
-        _, action, tx_id_text = call.data.split(":")
-        tx_id = int(tx_id_text)
-    except (ValueError, TypeError):
-        await call.message.edit_text("Invalid transaction action.")
-        return
-
+    chat_id = update.effective_chat.id
     with closing(get_conn()) as conn:
-        tx = conn.execute("SELECT * FROM transactions WHERE tx_id=?", (tx_id,)).fetchone()
-
-        if not tx or tx["status"] != "pending":
-            await call.message.edit_text("Transaction state already finalized.")
-            return
-
-        if action == "app":
-            new_status = "approved"
-            if tx["tx_type"] == "deposit":
-                adjust_balance(conn, tx["user_id"], tx["amount"])
-        elif action == "rej":
-            new_status = "rejected"
-            if tx["tx_type"] == "withdrawal":
-                adjust_balance(conn, tx["user_id"], tx["amount"])
-        else:
-            await call.message.edit_text("Invalid transaction action.")
-            return
-
-        conn.execute("UPDATE transactions SET status=? WHERE tx_id=?", (new_status, tx_id))
-        conn.commit()
-
-    await call.message.edit_text(f"Transaction #{tx_id} updated to: {new_status.upper()}.")
-
-    tx_result = dict(tx)
-    tx_result["status"] = new_status
-    await notify_user_tx_result(tx_result)
-
-
-# ---------------------------------------------------------------------------
-# Admin: Balances / Find ID / Broadcast / Stats
-# ---------------------------------------------------------------------------
-
-@router.message(F.text == "➕ Add Balance")
-async def admin_add_balance_ask_id(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id):
-        return
-    await message.answer("Enter target Telegram User ID to credit:", reply_markup=ForceReply(selective=True))
-    await state.set_state(AdminStates.add_balance_id)
-
-
-@router.message(F.text == "➖ Cut Balance")
-async def admin_cut_balance_ask_id(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id):
-        return
-    await message.answer("Enter target Telegram User ID to debit:", reply_markup=ForceReply(selective=True))
-    await state.set_state(AdminStates.cut_balance_id)
-
-
-@router.message(AdminStates.add_balance_id)
-async def admin_add_balance_ask_amount(message: Message, state: FSMContext):
-    try:
-        uid = int((message.text or "").strip())
-    except ValueError:
-        await message.answer("Please enter a numeric Telegram User ID.")
-        return
-
-    with closing(get_conn()) as conn:
-        row = conn.execute("SELECT user_id FROM users WHERE user_id=?", (uid,)).fetchone()
-    if not row:
-        await message.answer("Target User ID is not in the database.", reply_markup=get_admin_menu_keyboard())
-        await state.clear()
-        return
-
-    await state.update_data(target_id=uid)
-    await message.answer(f"Enter dollar amount to ADD to user {uid}'s balance:", reply_markup=ForceReply(selective=True))
-    await state.set_state(AdminStates.add_balance_amount)
-
-
-@router.message(AdminStates.cut_balance_id)
-async def admin_cut_balance_ask_amount(message: Message, state: FSMContext):
-    try:
-        uid = int((message.text or "").strip())
-    except ValueError:
-        await message.answer("Please enter a numeric Telegram User ID.")
-        return
-
-    with closing(get_conn()) as conn:
-        row = conn.execute("SELECT user_id FROM users WHERE user_id=?", (uid,)).fetchone()
-    if not row:
-        await message.answer("Target User ID is not in the database.", reply_markup=get_admin_menu_keyboard())
-        await state.clear()
-        return
-
-    await state.update_data(target_id=uid)
-    await message.answer(f"Enter dollar amount to CUT from user {uid}'s balance:", reply_markup=ForceReply(selective=True))
-    await state.set_state(AdminStates.cut_balance_amount)
-
-
-@router.message(AdminStates.add_balance_amount)
-async def admin_add_balance_commit(message: Message, state: FSMContext):
-    try:
-        amount = int((message.text or "").strip().replace("$", ""))
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("Please enter a positive dollar amount.")
-        return
-
-    data = await state.get_data()
-    uid = data.get("target_id")
-
-    with closing(get_conn()) as conn:
-        adjust_balance(conn, uid, amount)
-        conn.execute(
-            "INSERT INTO transactions (user_id, tx_type, method, amount, details, status, created_at) "
-            "VALUES (?, 'admin_credit', 'manual', ?, 'Admin balance credit', 'approved', ?)",
-            (uid, amount, datetime.utcnow().isoformat()),
-        )
-        conn.commit()
-        new_balance = get_balance(conn, uid)
-
-    await state.clear()
-    await message.answer(
-        f"✅ Added ${amount} to user {uid}. New balance: ${new_balance}.",
-        reply_markup=get_admin_menu_keyboard(),
-    )
-    try:
-        await bot.send_message(uid, f"💰 An admin credited ${amount} to your wallet.")
-    except (TelegramForbiddenError, TelegramBadRequest):
-        pass
-
-
-@router.message(AdminStates.cut_balance_amount)
-async def admin_cut_balance_commit(message: Message, state: FSMContext):
-    try:
-        amount = int((message.text or "").strip().replace("$", ""))
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("Please enter a positive dollar amount.")
-        return
-
-    data = await state.get_data()
-    uid = data.get("target_id")
-
-    with closing(get_conn()) as conn:
-        adjust_balance(conn, uid, -amount)
-        conn.execute(
-            "INSERT INTO transactions (user_id, tx_type, method, amount, details, status, created_at) "
-            "VALUES (?, 'admin_debit', 'manual', ?, 'Admin balance deduction', 'approved', ?)",
-            (uid, amount, datetime.utcnow().isoformat()),
-        )
-        conn.commit()
-        new_balance = get_balance(conn, uid)
-
-    await state.clear()
-    await message.answer(
-        f"✅ Cut ${amount} from user {uid}. New balance: ${new_balance}.",
-        reply_markup=get_admin_menu_keyboard(),
-    )
-    try:
-        await bot.send_message(uid, f"⚠️ An admin deducted ${amount} from your wallet.")
-    except (TelegramForbiddenError, TelegramBadRequest):
-        pass
-
-
-@router.message(F.text == "🔎 Check Balance")
-async def admin_check_balance_ask(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id):
-        return
-    await message.answer("Enter Telegram User ID to check:", reply_markup=ForceReply(selective=True))
-    await state.set_state(AdminStates.check_balance)
-
-
-@router.message(AdminStates.check_balance)
-async def admin_check_balance_commit(message: Message, state: FSMContext):
-    try:
-        uid = int((message.text or "").strip())
-    except ValueError:
-        await message.answer("Please enter a numeric Telegram User ID.")
-        return
-
-    with closing(get_conn()) as conn:
-        row = conn.execute(
-            "SELECT username, first_name, balance, is_banned FROM users WHERE user_id=?", (uid,)
-        ).fetchone()
-
-    await state.clear()
-
-    if not row:
-        await message.answer("Target User ID is not in the database.", reply_markup=get_admin_menu_keyboard())
-        return
-
-    username = f"@{row['username']}" if row["username"] else (row["first_name"] or "Unknown")
-    await message.answer(
-        f"👤 {username} (<code>{uid}</code>)\n"
-        f"💵 Balance: ${row['balance']}\n"
-        f"🚫 Banned: {'Yes' if row['is_banned'] else 'No'}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=get_admin_menu_keyboard(),
-    )
-
-
-@router.message(F.text == "🏆 Top Balances")
-async def admin_top_balances(message: Message):
-    if not admin_only(message.from_user.id):
-        return
-
-    with closing(get_conn()) as conn:
-        rows = top_balances(conn, limit=10)
+        rows = conn.execute(
+            """
+            SELECT w.username, w.balance
+            FROM group_players gp
+            JOIN wallets w ON w.user_id = gp.user_id
+            WHERE gp.chat_id=?
+            ORDER BY w.balance DESC LIMIT 10
+            """,
+            (chat_id,),
+        ).fetchall()
 
     if not rows:
-        await message.answer("No users yet.")
+        await update.message.reply_text("No players yet.")
         return
 
-    lines = ["🏆 <b>Top Balances</b>", ""]
-    for i, row in enumerate(rows, start=1):
-        username = f"@{row['username']}" if row["username"] else (row["first_name"] or "Unknown")
-        lines.append(f"{i}. {username} (<code>{row['user_id']}</code>) — ${row['balance']}")
-
-    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    lines = ["🏅 *Leaderboard*"]
+    for i, r in enumerate(rows, start=1):
+        lines.append(f"{i}. @{r['username'] or 'unknown'} - {r['balance']} pts")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-@router.message(F.text == "🔍 Find ID")
-async def admin_find_id_ask(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id):
+# ---------------------------------------------------------------------------
+# Admin panel
+# ---------------------------------------------------------------------------
+
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_admin(update, context):
         return
-    await message.answer("Enter the @username to look up:", reply_markup=ForceReply(selective=True))
-    await state.set_state(AdminStates.find_id)
-
-
-@router.message(AdminStates.find_id)
-async def admin_find_id_commit(message: Message, state: FSMContext):
-    username = (message.text or "").strip().lstrip("@")
-
+    if not context.args:
+        await update.message.reply_text("Usage: /ban <@username|user_id>")
+        return
     with closing(get_conn()) as conn:
-        uid = find_user_id_by_username(conn, username)
+        target_id = resolve_user_ref(conn, context.args[0])
+        if target_id is None:
+            await update.message.reply_text("Couldn't find that player (they may not have used the bot yet).")
+            return
+        conn.execute("UPDATE wallets SET banned=1 WHERE user_id=?", (target_id,))
+        conn.commit()
+    await update.message.reply_text(f"⛔ User {target_id} banned.")
+    await _notify_user(context, target_id, "⛔ You have been banned from playing by an admin.")
 
-    await state.clear()
 
-    if uid is None:
-        await message.answer(f"❌ No user found with username @{username}.", reply_markup=get_admin_menu_keyboard())
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_admin(update, context):
         return
-
-    await message.answer(
-        f"✅ @{username} → <code>{uid}</code>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=get_admin_menu_keyboard(),
-    )
-
-
-@router.message(F.text == "📢 Broadcast")
-async def admin_broadcast_ask(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id):
+    if not context.args:
+        await update.message.reply_text("Usage: /unban <@username|user_id>")
         return
-    await message.answer(
-        "Send the message you want broadcast to all known users:",
-        reply_markup=ForceReply(selective=True),
-    )
-    await state.set_state(AdminStates.broadcast)
-
-
-@router.message(AdminStates.broadcast)
-async def admin_broadcast_commit(message: Message, state: FSMContext):
-    await state.clear()
-
     with closing(get_conn()) as conn:
-        user_ids = all_user_ids(conn)
+        target_id = resolve_user_ref(conn, context.args[0])
+        if target_id is None:
+            await update.message.reply_text("Couldn't find that player.")
+            return
+        conn.execute("UPDATE wallets SET banned=0 WHERE user_id=?", (target_id,))
+        conn.commit()
+    await update.message.reply_text(f"✅ User {target_id} unbanned.")
+    await _notify_user(context, target_id, "✅ You have been unbanned and can play again.")
 
-    status_msg = await message.answer(f"📢 Broadcasting to {len(user_ids)} users...")
 
-    sent, failed = 0, 0
-    for uid in user_ids:
+async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_admin(update, context):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /deposit <@username|user_id> <amount>")
+        return
+    with closing(get_conn()) as conn:
+        target_id = resolve_user_ref(conn, context.args[0])
+        if target_id is None:
+            await update.message.reply_text("Couldn't find that player.")
+            return
         try:
-            await message.copy_to(chat_id=uid)
-            sent += 1
-        except (TelegramForbiddenError, TelegramBadRequest):
-            failed += 1
-        await asyncio.sleep(0.05)  # gentle pacing to stay under flood limits
+            amount = int(context.args[1])
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Amount must be a positive whole number.")
+            return
+        ensure_wallet(conn, target_id, None)
+        adjust_wallet(conn, target_id, amount, "deposit", admin_id=update.effective_user.id)
+        new_balance = get_wallet(conn, target_id)["balance"]
+    await update.message.reply_text(f"💰 Credited {amount} pts to {target_id}. New balance: {new_balance}.")
+    await _notify_user(context, target_id, f"💰 An admin credited {amount} pts to your wallet.")
 
-    await status_msg.edit_text(
-        f"📢 Broadcast complete.\n✅ Delivered: {sent}\n❌ Failed: {failed}"
-    )
 
-
-@router.message(F.text == "📊 View Stats")
-async def admin_view_stats(message: Message):
-    if not admin_only(message.from_user.id):
+async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_admin(update, context):
         return
-
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /withdraw <@username|user_id> <amount>")
+        return
     with closing(get_conn()) as conn:
-        s = stats_snapshot(conn)
+        target_id = resolve_user_ref(conn, context.args[0])
+        if target_id is None:
+            await update.message.reply_text("Couldn't find that player.")
+            return
+        try:
+            amount = int(context.args[1])
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Amount must be a positive whole number.")
+            return
+        wallet = ensure_wallet(conn, target_id, None)
+        if wallet["balance"] < amount:
+            await update.message.reply_text(
+                f"That player only has {wallet['balance']} pts — can't withdraw {amount}."
+            )
+            return
+        adjust_wallet(conn, target_id, -amount, "withdrawal", admin_id=update.effective_user.id)
+        new_balance = get_wallet(conn, target_id)["balance"]
+    await update.message.reply_text(f"🏧 Debited {amount} pts from {target_id}. New balance: {new_balance}.")
+    await _notify_user(context, target_id, f"🏧 An admin debited {amount} pts from your wallet.")
 
-    await message.answer(
-        "📊 <b>Bot Stats</b>\n\n"
-        f"👥 Total users: {s['total_users']}\n"
-        f"🚫 Banned users: {s['banned_users']}\n"
-        f"💰 Combined balance: ${s['total_balance']}\n"
-        f"🎮 Total bets placed: {s['total_bets']}\n"
-        f"✅ Bets resolved: {s['resolved_bets']}\n"
-        f"📑 Pending transactions: {s['pending_tx']}",
-        parse_mode=ParseMode.HTML,
+
+async def settax_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_admin(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /settax <percent 0-100>")
+        return
+    try:
+        percent = float(context.args[0])
+        if not (0 <= percent <= 100):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Percent must be a number between 0 and 100.")
+        return
+    with closing(get_conn()) as conn:
+        set_setting(conn, "tax_percent", percent)
+    await update.message.reply_text(f"🏛 House tax set to {percent:g}% of every payout.")
+
+
+async def tax_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with closing(get_conn()) as conn:
+        percent = get_tax_percent(conn)
+    await update.message.reply_text(f"🏛 Current house tax: {percent:g}% of every winning payout.")
+
+
+def _total_tax_collected(conn) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) AS total FROM transactions WHERE type='tax'"
+    ).fetchone()
+    return int(row["total"])
+
+
+async def housebalance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_admin(update, context):
+        return
+    with closing(get_conn()) as conn:
+        total = _total_tax_collected(conn)
+    await update.message.reply_text(f"🏛 Total tax collected: {total} pts.")
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_admin(update, context):
+        return
+    with closing(get_conn()) as conn:
+        tax_percent = get_tax_percent(conn)
+        total_tax = _total_tax_collected(conn)
+
+        players = conn.execute("SELECT COUNT(*) AS c FROM wallets").fetchone()["c"]
+        banned = conn.execute(
+            "SELECT COUNT(*) AS c FROM wallets WHERE banned=1"
+        ).fetchone()["c"]
+        circulating = conn.execute(
+            "SELECT COALESCE(SUM(balance), 0) AS s FROM wallets"
+        ).fetchone()["s"]
+
+        total_bets = conn.execute("SELECT COUNT(*) AS c FROM bets").fetchone()["c"]
+        resolved_bets = conn.execute(
+            "SELECT COUNT(*) AS c FROM bets WHERE status='resolved'"
+        ).fetchone()["c"]
+        pending_bets = conn.execute(
+            "SELECT COUNT(*) AS c FROM bets WHERE status IN ('pending','accepted')"
+        ).fetchone()["c"]
+        volume = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS s FROM bets WHERE status='resolved'"
+        ).fetchone()["s"]
+
+        active_groups = conn.execute(
+            "SELECT COUNT(DISTINCT chat_id) AS c FROM group_players"
+        ).fetchone()["c"]
+
+    text = (
+        "📊 *Bot Stats*\n\n"
+        f"👥 Players: {players} ({banned} banned)\n"
+        f"💰 Points in circulation: {circulating}\n"
+        f"🏟 Active groups: {active_groups}\n\n"
+        f"🎲 Bets total: {total_bets} "
+        f"({resolved_bets} resolved, {pending_bets} open)\n"
+        f"📈 Total volume wagered (resolved): {volume} pts\n\n"
+        f"🏛 Tax rate: {tax_percent:g}%\n"
+        f"🏛 Total tax collected: {total_tax} pts"
     )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_admin(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /addadmin <user_id>")
+        return
+    try:
+        new_admin_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Provide a numeric Telegram user id.")
+        return
+    with closing(get_conn()) as conn:
+        conn.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (new_admin_id,))
+        conn.commit()
+    await update.message.reply_text(f"✅ {new_admin_id} is now an admin.")
 
 
 # ---------------------------------------------------------------------------
-# Render Health Server
+# HTTP Health Check Server
 # ---------------------------------------------------------------------------
 
-class HealthHandler(BaseHTTPRequestHandler):
+class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
@@ -1881,40 +1138,55 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
-        return
+        pass
 
 
 def start_health_server():
-    port = int(os.environ.get("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    logger.info("Health server started on port %s", port)
+    logger.info(f"Health check server listening on port {port}")
 
 
 # ---------------------------------------------------------------------------
-# Fallback: catch admin-only buttons tapped by non-admins silently
+# Entrypoint
 # ---------------------------------------------------------------------------
 
-@router.message(F.text.in_(ADMIN_MENU_BUTTONS))
-async def admin_button_guard(message: Message):
-    # Reachable only if none of the admin_only-gated handlers above matched
-    # first (i.e. a non-admin somehow has the admin keyboard open).
-    if not admin_only(message.from_user.id):
-        await message.answer("Unauthorized access.")
+def main():
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        raise SystemExit("Set the BOT_TOKEN environment variable to your Telegram bot token.")
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-async def main():
     init_db()
+    bootstrap_admins()
     start_health_server()
-    logger.info("BlockVerse-BOT successfully initialized.")
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+
+    app = Application.builder().token(token).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("balance", balance_cmd))
+
+    app.add_handler(bet_conv)
+    app.add_handler(CommandHandler("accept", accept_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CommandHandler("mybets", mybets_cmd))
+    app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
+
+    app.add_handler(CommandHandler("ban", ban_cmd))
+    app.add_handler(CommandHandler("unban", unban_cmd))
+    app.add_handler(CommandHandler("deposit", deposit_cmd))
+    app.add_handler(CommandHandler("withdraw", withdraw_cmd))
+    app.add_handler(CommandHandler("settax", settax_cmd))
+    app.add_handler(CommandHandler("tax", tax_cmd))
+    app.add_handler(CommandHandler("housebalance", housebalance_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("addadmin", addadmin_cmd))
+
+    logger.info("Bot starting...")
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
